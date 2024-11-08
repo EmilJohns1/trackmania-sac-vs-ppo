@@ -1,3 +1,4 @@
+import pickle
 import random
 import time
 from collections import deque
@@ -51,7 +52,11 @@ class Actor(nn.Module):
         x = F.relu(self.fc2(x))
         mu = self.mu(x)
         log_std = self.log_std(x)
+
+        log_std[:, 1] = -10
+        log_std[:, 2] = -10
         std = torch.exp(log_std).clamp(min=1e-6)
+
         return mu, std
 
 
@@ -114,18 +119,23 @@ class SACAgent:
         act_dim (int): Dimension of the action space.
     """
 
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_dim, act_dim, alpha_start=0.2, alpha_decay=0.99):
         # Define networks
-        self.alpha = 0.10
         self.actor = Actor(obs_dim, act_dim).to(device)
         self.critic1 = Critic(obs_dim, act_dim).to(device)
         self.critic2 = Critic(obs_dim, act_dim).to(device)
         self.target_critic1 = Critic(obs_dim, act_dim).to(device)
         self.target_critic2 = Critic(obs_dim, act_dim).to(device)
 
-        self.target_entropy = -act_dim
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.target_entropy = (
+            -act_dim / 2
+        )  # We reduce the entropy from -3 to -1.5 to reduce exploratory behavior
+        self.log_alpha = torch.tensor(
+            np.log(alpha_start), requires_grad=True, device=device
+        )
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.alpha = self.log_alpha.exp()
+        self.alpha_decay = alpha_decay
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=3e-4)
@@ -185,18 +195,31 @@ class SACAgent:
         q2_new = self.critic2(obs, new_action)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (self.alpha * log_prob - q_new).mean()
+
+        # Gas regularization
+        target_gas = 0.8
+        gas_regularization = F.mse_loss(
+            new_action[:, 0], torch.full_like(new_action[:, 0], target_gas)
+        )
+        actor_loss += 0.01 * gas_regularization
+
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        actor_loss.backward()  # No need for retain_graph=True here
         self.actor_optimizer.step()
+
+        if self.alpha_decay < 1.0:
+            self.log_alpha.data = self.log_alpha.data * self.alpha_decay
+            self.alpha = self.log_alpha.exp()
 
         alpha_loss = -(
             self.log_alpha * (log_prob + self.target_entropy).detach()
         ).mean()
         self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
+        alpha_loss.backward()  # Separate backward pass for alpha
         self.alpha_optimizer.step()
-        self.alpha = self.log_alpha.exp()
+        self.alpha = self.log_alpha.exp().clamp(min=0.01)
 
+        # Update target critics
         for target_param, param in zip(
             self.target_critic1.parameters(), self.critic1.parameters()
         ):
@@ -265,10 +288,10 @@ def preprocess_obs(obs, lidar_cnn):
     return processed_obs
 
 
-"""Save agent and replay buffer states to a checkpoint file."""
+"""Saves the SAC agent"""
 
 
-def save_agent(agent, replay_buffer, filename="agents/sac_agent.pth"):
+def save_agent(agent, filename="agents/sac_agent.pth"):
     torch.save(
         {
             "actor_state_dict": agent.actor.state_dict(),
@@ -281,18 +304,26 @@ def save_agent(agent, replay_buffer, filename="agents/sac_agent.pth"):
             "critic2_optimizer_state_dict": agent.critic2_optimizer.state_dict(),
             "log_alpha": agent.log_alpha,
             "alpha_optimizer_state_dict": agent.alpha_optimizer.state_dict(),
-            "replay_buffer": replay_buffer.buffer,
         },
         filename,
     )
     print("Agent saved to", filename)
 
 
-"""Loads the SAC agent and its replay buffer if it exists."""
+"""Saves the replay buffer"""
 
 
-def load_agent(agent, replay_buffer, filename="agents/sac_agent.pth"):
-    checkpoint = torch.load(filename)
+def save_replay_buffer(replay_buffer, filename="agents/sac_replay_buffer.pkl"):
+    with open(filename, "wb") as f:
+        pickle.dump(replay_buffer.buffer, f)
+    print("Replay buffer saved to", filename)
+
+
+"""Loads the saved SAC agent if it exists."""
+
+
+def load_agent(agent, filename="agents/sac_agent.pth"):
+    checkpoint = torch.load(filename, map_location=device)
     agent.actor.load_state_dict(checkpoint["actor_state_dict"])
     agent.critic1.load_state_dict(checkpoint["critic1_state_dict"])
     agent.critic2.load_state_dict(checkpoint["critic2_state_dict"])
@@ -305,9 +336,16 @@ def load_agent(agent, replay_buffer, filename="agents/sac_agent.pth"):
     agent.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
 
     agent.log_alpha = checkpoint["log_alpha"]
-    replay_buffer.buffer = checkpoint["replay_buffer"]
-
     print("Agent loaded from", filename)
+
+
+"""Loads the saved replay buffer for the SAC agent"""
+
+
+def load_replay_buffer(replay_buffer, filename="agents/replay_buffer.pkl"):
+    with open(filename, "rb") as f:
+        replay_buffer.buffer = pickle.load(f)
+    print("Replay buffer loaded from", filename)
 
 
 # Set up the environment
@@ -333,18 +371,20 @@ agent = SACAgent(obs_dim, act_dim)
 lidar_cnn = LidarCNN().to(device)
 
 # Define checkpoint file
-checkpoint_file = "agents/sac_agent.pth"
+agent_checkpoint_file = "agents/sac_agent.pth"
+replay_buffer_file = "agents/sac_replay_buffer.pkl"
 
-# Try loading the agent if a checkpoint exists
+# Try loading the agent and replay buffer if checkpoints exist
 try:
-    load_agent(agent, replay_buffer, checkpoint_file)
+    load_agent(agent, agent_checkpoint_file)
+    load_replay_buffer(replay_buffer, replay_buffer_file)
 except FileNotFoundError:
-    print("No saved agent found, starting fresh.")
+    print("No saved agent or replay buffer found, starting fresh.")
 
 # Start training loop
 obs, info = env.reset()  # Initial environment reset
 for step in range(10000000):  # Total number of training steps
-    time.sleep(0.01)  # Small delay to match environment timing if needed
+    # time.sleep(0.01)  # Small delay to match environment timing if needed
 
     # Preprocess observation
     processed_obs = preprocess_obs(obs, lidar_cnn)
@@ -370,9 +410,10 @@ for step in range(10000000):  # Total number of training steps
     if replay_buffer.size() >= batch_size:
         agent.update_parameters(replay_buffer)
 
-    # Save agent periodically
+    # Save agent and replay buffer periodically
     if step % 10000 == 0:  # Save every 10,000 steps
-        save_agent(agent, replay_buffer, checkpoint_file)
+        save_agent(agent, agent_checkpoint_file)
+        save_replay_buffer(replay_buffer, replay_buffer_file)
 
     # Reset environment if episode is done
     if done:
