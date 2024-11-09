@@ -86,7 +86,7 @@ class LidarCNN(nn.Module):
     """
     A CNN to process LIDAR data as a feature extractor for SAC agent.
 
-    Processes input shape (4, 64, 64) into a vector of size 64 (8 x 8).
+    Processes input shape (4, 64, 64) into a vector of size 256 (16 x 16).
     This is done to make the computations easier, as our computer wasn't powerful enough to handle the original input shape.
     """
 
@@ -99,14 +99,14 @@ class LidarCNN(nn.Module):
             32, 64, kernel_size=3, stride=2, padding=1
         )  # From (32, 32, 32) -> (64, 16, 16)
         self.fc = nn.Linear(
-            64 * 16 * 16, 64
-        )  # Flatten the output and reduce to a vector of length 64
+            64 * 16 * 16, 256
+        )  # Flatten the output and reduce to a vector of length 256
 
     def forward(self, x):
         x = F.relu(self.conv1(x))  # Apply ReLU activation
         x = F.relu(self.conv2(x))
         x = x.view(x.size(0), -1)  # Flatten the output
-        x = F.relu(self.fc(x))  # Fully connected layer to reduce to 64 features
+        x = F.relu(self.fc(x))  # Fully connected layer to reduce to 256 features
         return x
 
 
@@ -127,9 +127,7 @@ class SACAgent:
         self.target_critic1 = Critic(obs_dim, act_dim).to(device)
         self.target_critic2 = Critic(obs_dim, act_dim).to(device)
 
-        self.target_entropy = (
-            -act_dim / 2
-        )  # We reduce the entropy from -3 to -1.5 to reduce exploratory behavior
+        self.target_entropy = -act_dim
         self.log_alpha = torch.tensor(
             np.log(alpha_start), requires_grad=True, device=device
         )
@@ -161,9 +159,7 @@ class SACAgent:
         x_t = dist.rsample()
         action = torch.tanh(x_t)
 
-        log_prob = dist.log_prob(x_t) - torch.log(
-            1 - action.pow(2) + 1e-6
-        )  # Use log_prob for the tanh trick
+        log_prob = dist.log_prob(x_t) - torch.log(1 - action.pow(2) + 1e-6)
 
         return action, log_prob.sum(1, keepdim=True)
 
@@ -201,10 +197,10 @@ class SACAgent:
         gas_regularization = F.mse_loss(
             new_action[:, 0], torch.full_like(new_action[:, 0], target_gas)
         )
-        actor_loss += 0.01 * gas_regularization
+        actor_loss += 0.2 * gas_regularization
 
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()  # No need for retain_graph=True here
+        actor_loss.backward()
         self.actor_optimizer.step()
 
         if self.alpha_decay < 1.0:
@@ -352,7 +348,7 @@ def load_replay_buffer(replay_buffer, filename="agents/replay_buffer.pkl"):
 env = get_environment()
 
 # Replay buffer and agent configuration
-buffer_size = 1000000  # Size of the replay buffer
+buffer_size = 100000  # Size of the replay buffer
 batch_size = 64  # Batch size for sampling
 
 # Initialize the replay buffer
@@ -360,8 +356,8 @@ replay_buffer = ReplayBuffer(buffer_size, batch_size)
 
 # Observation and action dimensions (adjusted to environment specifics)
 obs_dim = (
-    1 + 1 + 3 + (8 * 8)
-)  # observation space using our CNN to transform our LIDAR images from (4, 64, 64) to (8 x 8)
+    1 + 1 + 3 + 256
+)  # observation space using our CNN to transform our LIDAR images from (4, 64, 64) to (16 x 16)
 act_dim = 3  # action space with [gas, brake, steer]
 
 # Initialize the agent
@@ -383,8 +379,10 @@ except FileNotFoundError:
 
 # Start training loop
 obs, info = env.reset()  # Initial environment reset
+reward = 0
+
 for step in range(10000000):  # Total number of training steps
-    # time.sleep(0.01)  # Small delay to match environment timing if needed
+    time.sleep(0.01)  # Small delay to match environment timing if needed
 
     # Preprocess observation
     processed_obs = preprocess_obs(obs, lidar_cnn)
@@ -396,6 +394,24 @@ for step in range(10000000):  # Total number of training steps
     action = (
         act.cpu().detach().numpy().flatten()
     )  # Convert action to numpy for environment
+
+    # Get the speed from the observation (obs[0])
+    speed = obs[0]
+
+    # 1. Penalize for braking when speed is below 10
+    if speed < 15 and action[1] > 0:  # action[1] corresponds to the brake action
+        reward -= 1  # Penalize for braking at low speed
+        action[1] = 0  # Make braking illegal by setting brake action to 0
+
+    # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
+    if speed < 15 and action[0] != 1:  # action[0] corresponds to throttle/acceleration
+        reward -= 1  # Penalize for not accelerating at low speed
+        action[0] = 1  # Force acceleration (throttle) to 1
+
+    # 3. Prevent steering when speed is below 5 (action[2] corresponds to steering)
+    if speed < 15 and action[2] != 0:
+        reward -= 1
+        action[2] = 0  # Make steering illegal by setting action[2] to 0
 
     # Take a step in the environment
     obs_next, reward, terminated, truncated, info = env.step(action)
