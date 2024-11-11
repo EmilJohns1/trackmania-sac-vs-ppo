@@ -83,7 +83,7 @@ class SACAgent:
         act_dim (int): Dimension of the action space.
     """
 
-    def __init__(self, obs_dim, act_dim, alpha_start=0.2, alpha_decay=0.99):
+    def __init__(self, obs_dim, act_dim, alpha=0.2):
         # Define networks
         self.actor = Actor(obs_dim, act_dim).to(device)
         self.critic1 = Critic(obs_dim, act_dim).to(device)
@@ -92,12 +92,9 @@ class SACAgent:
         self.target_critic2 = Critic(obs_dim, act_dim).to(device)
 
         self.target_entropy = -act_dim
-        self.log_alpha = torch.tensor(
-            np.log(alpha_start), requires_grad=True, device=device
-        )
+        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
         self.alpha = self.log_alpha.exp()
-        self.alpha_decay = alpha_decay
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=3e-4)
@@ -105,6 +102,11 @@ class SACAgent:
 
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
+
+        # Initialize mean and std for normalization
+        self.obs_mean = np.zeros(obs_dim)
+        self.obs_var = np.ones(obs_dim)
+        self.obs_count = 1e-5  # Small constant to prevent division by zero
 
     def sample_action(self, obs):
         mu, std = self.actor(obs)
@@ -148,19 +150,9 @@ class SACAgent:
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (self.alpha * log_prob - q_new).mean()
 
-        target_gas = 0.8
-        gas_regularization = F.mse_loss(
-            new_action[:, 0], torch.full_like(new_action[:, 0], target_gas)
-        )
-        actor_loss += 0.2 * gas_regularization
-
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-
-        if self.alpha_decay < 1.0:
-            self.log_alpha.data = self.log_alpha.data * self.alpha_decay
-            self.alpha = self.log_alpha.exp()
 
         alpha_loss = -(
             self.log_alpha * (log_prob + self.target_entropy).detach()
@@ -180,6 +172,86 @@ class SACAgent:
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
         return reward
+
+    def update_obs_stats(self, obs):
+        self.obs_count += 1
+        delta = obs - self.obs_mean
+        self.obs_mean += delta / self.obs_count
+        delta2 = obs - self.obs_mean
+        self.obs_var += delta * delta2
+
+    def preprocess_obs(self, obs):
+        # Handle the case where obs has an empty dictionary as the second element
+        if (
+            isinstance(obs, tuple)
+            and len(obs) > 1
+            and isinstance(obs[1], dict)
+            and not obs[1]
+        ):
+            obs_data = obs[0]  # Use the first element directly if there's an empty dict
+        else:
+            obs_data = obs  # Otherwise, use the entire tuple as expected
+
+        expected_obs_size = 85
+
+        # Check if obs_data contains the expected components for normal processing
+        if isinstance(obs_data, tuple) and len(obs_data) == 4:
+            # Process each component of the observation data
+            speed = np.asarray(
+                obs_data[0]
+            ).flatten()
+            lidar = np.asarray(obs_data[1]).reshape(-1)  # Flatten it to shape (76,)
+            prev_action_1 = np.asarray(obs_data[2]).flatten()  # (3,)
+            prev_action_2 = np.asarray(obs_data[3]).flatten()  # (3,)
+
+            # Check for NaNs
+            if (
+                np.any(np.isnan(speed))
+                or np.any(np.isnan(lidar))
+                or np.any(np.isnan(prev_action_1))
+                or np.any(np.isnan(prev_action_2))
+            ):
+                print("NaN detected in observation components")
+
+            # Compute the current and next distances to the centerline
+            current_centerline_distance = lidar[0] - lidar[18]
+            next_lidar = np.asarray(
+                obs_data[1][1]
+            )  # Assuming the next lidar scan is here
+            next_centerline_distance = next_lidar[0] - next_lidar[18]
+
+            # Concatenate all components into a single observation vector
+            concatenated_obs = np.concatenate(
+                [
+                    speed,
+                    lidar,
+                    prev_action_1,
+                    prev_action_2,
+                    [current_centerline_distance, next_centerline_distance],
+                ]
+            )
+
+            # Ensure the observation has the expected size by padding if necessary
+            if concatenated_obs.shape[0] != expected_obs_size:
+                print("Observation size mismatch. Padding or truncating to fit.")
+                concatenated_obs = np.pad(
+                    concatenated_obs,
+                    (0, max(0, expected_obs_size - concatenated_obs.shape[0])),
+                )[:expected_obs_size]
+        else:
+            # Handle the unexpected structure case by returning a zero-filled tensor
+            print("Unexpected observation structure:", obs_data)
+            concatenated_obs = np.zeros(expected_obs_size)
+
+        # Update statistics with the new observation
+        self.update_obs_stats(concatenated_obs)
+
+        # Normalize using the current mean and std deviation
+        normalized_obs = (concatenated_obs - self.obs_mean) / np.sqrt(
+            self.obs_var / self.obs_count
+        )
+
+        return torch.tensor(normalized_obs, dtype=torch.float32).to(device)
 
 
 class ReplayBuffer:
@@ -203,77 +275,6 @@ class ReplayBuffer:
 
     def size(self):
         return len(self.buffer)
-
-
-def preprocess_obs(obs):
-    # Check if obs contains an empty dictionary as the second element
-    if (
-        isinstance(obs, tuple)
-        and len(obs) > 1
-        and isinstance(obs[1], dict)
-        and not obs[1]
-    ):
-        # Handle the case where obs has an empty dict as the second element
-        obs_data = obs[0]  # Use the first element directly if there's an empty dict
-    else:
-        obs_data = obs  # Otherwise, use the entire tuple as expected
-
-    # Define the expected observation size
-    expected_obs_size = 85
-
-    # Check if obs_data contains the expected components for normal processing
-    if isinstance(obs_data, tuple) and len(obs_data) == 4:
-        # Process each component of the observation data
-        speed = np.asarray(
-            obs_data[0]
-        ).flatten()  # Assuming this is a single-element array
-        lidar = np.asarray(obs_data[1]).reshape(-1)  # Flatten it to shape (76,)
-        prev_action_1 = np.asarray(obs_data[2]).flatten()  # (3,)
-        prev_action_2 = np.asarray(obs_data[3]).flatten()  # (3,)
-
-        # Check for NaNs
-        if (
-            np.any(np.isnan(speed))
-            or np.any(np.isnan(lidar))
-            or np.any(np.isnan(prev_action_1))
-            or np.any(np.isnan(prev_action_2))
-        ):
-            print("NaN detected in observation components")
-
-        # Current distance to centerline (difference between lidar[0] and lidar[18])
-        current_centerline_distance = lidar[0] - lidar[18]
-
-        # Next distance to centerline (using the next lidar scan obs[1][1])
-        next_lidar = np.asarray(
-            obs_data[1][1]
-        )  # Next lidar scan (shape should be (19,))
-        next_centerline_distance = next_lidar[0] - next_lidar[18]
-
-        # Concatenate all components into a single observation vector
-        concatenated_obs = np.concatenate(
-            [
-                speed,
-                lidar,
-                prev_action_1,
-                prev_action_2,
-                [current_centerline_distance, next_centerline_distance],
-            ]
-        )
-
-        # Ensure the observation has the expected size by padding if necessary
-        if concatenated_obs.shape[0] != expected_obs_size:
-            print("Observation size mismatch. Padding or truncating to fit.")
-            concatenated_obs = np.pad(
-                concatenated_obs,
-                (0, max(0, expected_obs_size - concatenated_obs.shape[0])),
-            )[:expected_obs_size]
-    else:
-        # Handle the unexpected structure case by returning a zero-filled tensor
-        print("Unexpected observation structure:", obs_data)
-        concatenated_obs = np.zeros(expected_obs_size)
-
-    # Convert to torch tensor and return
-    return torch.tensor(concatenated_obs, dtype=torch.float32).to(device)
 
 
 def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
@@ -339,18 +340,12 @@ def load_replay_buffer(
 
 env = get_environment()
 
-obs_dim = preprocess_obs(env.reset()).shape[0]
-act_dim = env.action_space.shape[0]
-
-print(obs_dim)
-print(act_dim)
+agent = SACAgent(85, 3)
 
 BUFFER_SIZE = int(1e6)
 BATCH_SIZE = 256
 
 replay_buffer = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE)
-
-agent = SACAgent(obs_dim, act_dim)
 
 agent_checkpoint_file = "agents/sac_agent_tm20lidar.pth"
 replay_buffer_file = "agents/sac_replay_buffer_tm20lidar.pkl"
@@ -370,7 +365,7 @@ for step in range(10000000):  # Total number of training steps
     time.sleep(0.01)  # Small delay to match environment timing
 
     # Preprocess observation
-    processed_obs = preprocess_obs(obs)
+    processed_obs = agent.preprocess_obs(obs)
 
     # Convert processed observation to tensor for action sampling
     act, log_prob = agent.sample_action(
@@ -415,7 +410,9 @@ for step in range(10000000):  # Total number of training steps
     done = terminated or truncated  # Check if episode is done
 
     # Store experience in replay buffer
-    replay_buffer.store(processed_obs, action, reward, preprocess_obs(obs_next), done)
+    replay_buffer.store(
+        processed_obs, action, reward, agent.preprocess_obs(obs_next), done
+    )
 
     # Start training if enough samples are available
     if replay_buffer.size() >= BATCH_SIZE:
