@@ -1,8 +1,10 @@
+import json
 import pickle
 import random
 import time
 from collections import deque
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -197,9 +199,7 @@ class SACAgent:
         # Check if obs_data contains the expected components for normal processing
         if isinstance(obs_data, tuple) and len(obs_data) == 4:
             # Process each component of the observation data
-            speed = np.asarray(
-                obs_data[0]
-            ).flatten()
+            speed = np.asarray(obs_data[0]).flatten()
             lidar = np.asarray(obs_data[1]).reshape(-1)  # Flatten it to shape (76,)
             prev_action_1 = np.asarray(obs_data[2]).flatten()  # (3,)
             prev_action_2 = np.asarray(obs_data[3]).flatten()  # (3,)
@@ -214,7 +214,7 @@ class SACAgent:
                 print("NaN detected in observation components")
 
             # Compute the current and next distances to the centerline
-            current_centerline_distance = lidar[0] - lidar[18]
+            current_centerline_distance = calculate_centerline_distance(obs)
             next_lidar = np.asarray(
                 obs_data[1][1]
             )  # Assuming the next lidar scan is here
@@ -277,6 +277,11 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+def calculate_centerline_distance(obs):
+    lidar = np.asarray(obs[1]).reshape(-1)
+    return lidar[0] - lidar[18]
+
+
 def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     torch.save(
         {
@@ -299,11 +304,13 @@ def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
 """Saves the replay buffer"""
 
 
+"""Saves the replay buffer using joblib"""
+
+
 def save_replay_buffer(
     replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"
 ):
-    with open(filename, "wb") as f:
-        pickle.dump(replay_buffer.buffer, f)
+    joblib.dump(replay_buffer.buffer, filename)
     print("Replay buffer saved to", filename)
 
 
@@ -327,14 +334,13 @@ def load_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     print("Agent loaded from", filename)
 
 
-"""Loads the saved replay buffer for the SAC agent"""
+"""Loads the saved replay buffer for the SAC agent using joblib"""
 
 
 def load_replay_buffer(
     replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"
 ):
-    with open(filename, "rb") as f:
-        replay_buffer.buffer = pickle.load(f)
+    replay_buffer.buffer = joblib.load(filename)
     print("Replay buffer loaded from", filename)
 
 
@@ -360,6 +366,7 @@ except FileNotFoundError:
 obs, info = env.reset()  # Initial environment reset
 reward = 0
 previous_speed = 0
+THRESHOLD = 1.5
 
 for step in range(10000000):  # Total number of training steps
     time.sleep(0.01)  # Small delay to match environment timing
@@ -403,6 +410,16 @@ for step in range(10000000):  # Total number of training steps
         reward -= min(-speed_diff, max_penalty)
 
     previous_speed = speed
+
+    # Extract the most recent lidar data from the processed observation
+    lidar = obs[1][0]
+
+    # Check if any beam is too close to an obstacle
+    if np.any(lidar < 50):
+        reward -= 5  # Penalize for proximity to walls
+
+    if abs(action[2] - obs[3][2]) > THRESHOLD:
+        reward -= 0.5
 
     # Take a step in the environment
     obs_next, reward, terminated, truncated, info = env.step(action)
