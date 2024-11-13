@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from matplotlib import pyplot as plt
 from tmrl import get_environment
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -298,6 +299,33 @@ def calculate_centerline_distance(obs):
     return lidar[0] - lidar[18]
 
 
+"""Function to plot and save graphs"""
+def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record, filename_prefix="performance"):
+    # Plot cumulative reward vs. steps
+    plt.figure(figsize=(12, 6))
+
+    # Cumulative Reward vs Steps
+    plt.subplot(1, 2, 1)
+    plt.plot(steps_record, cumulative_rewards, label="Cumulative Reward")
+    plt.xlabel("Steps")
+    plt.ylabel("Cumulative Reward")
+    plt.title("Cumulative Reward vs Steps")
+    plt.legend()
+
+    # Fastest Lap Time vs Steps
+    plt.subplot(1, 2, 2)
+    plt.plot(steps_record, fastest_lap_times, label="Fastest Lap Time")
+    plt.xlabel("Steps")
+    plt.ylabel("Fastest Lap Time (s)")
+    plt.title("Fastest Lap Time vs Steps")
+    plt.legend()
+
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig(f"{filename_prefix}_step_{steps}.png")
+    plt.close()
+    print(f"Saved graphs at step {steps}.")
+
 """Saves the current values of the SAC agent)"""
 def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     torch.save(
@@ -376,6 +404,16 @@ reward = 0
 previous_speed = 0
 THRESHOLD = 1.5
 
+cumulative_rewards = []
+fastest_lap_times = []
+steps_record = []
+
+cumulative_reward = 0
+current_reward = 0
+fastest_lap_time = float("inf")
+episode_start_time = time.time()
+
+
 for step in range(10000000):  # Total number of training steps
     time.sleep(0.01)  # Small delay to match environment timing
 
@@ -394,17 +432,17 @@ for step in range(10000000):  # Total number of training steps
     speed = obs[0]
 
     # 1. Penalize for braking when speed is below 10
-    if speed < 15 and action[1] > 0:
+    if speed < 25 and action[1] > 0:
         reward -= 1  # Penalize for braking at low speed
         action[1] = 0  # Make braking illegal by setting brake action to 0
 
     # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
-    if speed < 15 and action[0] != 1:
+    if speed < 25 and action[0] < 0.8:
         reward -= 1  # Penalize for not accelerating at low speed
         action[0] = 1  # Force acceleration (throttle) to 1
 
     # 3. Prevent steering when speed is below 5 (action[2] corresponds to steering)
-    if speed < 15 and action[2] != 0:
+    if speed < 25 and action[2] != 0:
         reward -= 1
         action[2] = 0  # Make steering illegal by setting action[2] to 0
 
@@ -423,33 +461,51 @@ for step in range(10000000):  # Total number of training steps
     lidar = obs[1][0]
 
     # Check if any beam is too close to an obstacle
-    if np.any(lidar < 50):
+    if np.any(lidar < 100):
         reward -= 5  # Penalize for proximity to walls
 
     if abs(action[2] - obs[3][2]) > THRESHOLD:
         reward -= 0.5
 
+    current_reward = reward
+
     # Take a step in the environment
     obs_next, reward, terminated, truncated, info = env.step(action)
 
-    done = terminated or truncated  # Check if episode is done
+    # Accumulate the reward
+    cumulative_reward += reward
 
-    # Store experience in replay buffer
+    done = terminated or truncated
+    if done:
+        episode_time = time.time() - episode_start_time
+        episode_start_time = time.time()
+
+        if (episode_time < fastest_lap_time) and current_reward > 50 :
+            fastest_lap_time = episode_time
+
+        cumulative_rewards.append(cumulative_reward)
+        fastest_lap_times.append(fastest_lap_time)
+        steps_record.append(step)
+
+        cumulative_reward = 0
+
+        # Reset environment
+        obs, info = env.reset()
+    else:
+        obs = obs_next  # Update observation for next step
+
+    # Store experience in replay buffer and update parameters
     replay_buffer.store(
         processed_obs, action, reward, agent.preprocess_obs(obs_next), done
     )
 
-    # Start training if enough samples are available
     if replay_buffer.size() >= BATCH_SIZE:
         agent.update_parameters(replay_buffer)
 
     # Save agent and replay buffer periodically
-    if step % 10000 == 0:  # Save every 10,000 steps
+    if step % 10000 == 0 and step != 0:
         save_agent(agent, agent_checkpoint_file)
         save_replay_buffer(replay_buffer, replay_buffer_file)
 
-    # Reset environment if episode is done
-    if done:
-        obs, info = env.reset()
-    else:
-        obs = obs_next  # Update observation for next step
+        # Plot and save graphs every 10,000 steps
+        plot_and_save_graphs(step, cumulative_rewards, fastest_lap_times, steps_record)
