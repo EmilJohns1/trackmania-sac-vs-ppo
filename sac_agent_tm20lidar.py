@@ -13,7 +13,7 @@ import torch.optim as optim
 from matplotlib import pyplot as plt
 from tmrl import get_environment
 
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Actor(nn.Module):
@@ -432,17 +432,17 @@ for step in range(10000000):  # Total number of training steps
     speed = obs[0]
 
     # 1. Penalize for braking when speed is below 10
-    if speed < 25 and action[1] > 0:
+    if speed < 20 and action[1] > 0:
         reward -= 1  # Penalize for braking at low speed
         action[1] = 0  # Make braking illegal by setting brake action to 0
 
     # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
-    if speed < 25 and action[0] < 0.8:
+    if speed < 20 and action[0] < 0.8:
         reward -= 1  # Penalize for not accelerating at low speed
         action[0] = 1  # Force acceleration (throttle) to 1
 
     # 3. Prevent steering when speed is below 5 (action[2] corresponds to steering)
-    if speed < 25 and action[2] != 0:
+    if speed < 20 and action[2] != 0:
         reward -= 1
         action[2] = 0  # Make steering illegal by setting action[2] to 0
 
