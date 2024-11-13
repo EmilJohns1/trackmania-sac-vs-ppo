@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tmrl import get_environment
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 
 class Actor(nn.Module):
