@@ -110,6 +110,7 @@ class SACAgent:
         self.obs_var = np.ones(obs_dim)
         self.obs_count = 1e-5  # Small constant to prevent division by zero
 
+    """Action sampling method for the SAC agent"""
     def sample_action(self, obs):
         mu, std = self.actor(obs)
 
@@ -122,6 +123,7 @@ class SACAgent:
 
         return action, log_prob.sum(1, keepdim=True)
 
+    """Method to update the parameters of the SAC agent"""
     def update_parameters(self, replay_buffer, gamma=0.99, tau=0.005):
         obs, action, reward, next_obs, done = replay_buffer.sample()
         with torch.no_grad():
@@ -175,6 +177,7 @@ class SACAgent:
 
         return reward
 
+    """Method to update the observation statistics for normalization"""
     def update_obs_stats(self, obs):
         self.obs_count += 1
         delta = obs - self.obs_mean
@@ -182,6 +185,7 @@ class SACAgent:
         delta2 = obs - self.obs_mean
         self.obs_var += delta * delta2
 
+    """Method to preprocess the observation data for the SAC agent"""
     def preprocess_obs(self, obs):
         # Handle the case where obs has an empty dictionary as the second element
         if (
@@ -255,13 +259,23 @@ class SACAgent:
 
 
 class ReplayBuffer:
+    """
+    Replay buffer for storing experiences and sampling mini-batches for training.
+
+    Args:
+        buffer_size (int): Maximum size of the replay buffer.
+        batch_size (int): Size of mini-batches to sample.
+    """
+
     def __init__(self, buffer_size, batch_size):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
 
+    """Stores a new experience tuple in the replay buffer"""
     def store(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
 
+    """Samples a mini-batch of experiences from the replay buffer"""
     def sample(self):
         batch = random.sample(self.buffer, self.batch_size)
         states, actions, rewards, next_states, dones = map(np.array, zip(*batch))
@@ -273,15 +287,18 @@ class ReplayBuffer:
             torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(device),
         )
 
+    """Returns the current size of the replay buffer"""
     def size(self):
         return len(self.buffer)
 
 
+"""Calculates the distance to the centerline from the lidar scan data"""
 def calculate_centerline_distance(obs):
     lidar = np.asarray(obs[1]).reshape(-1)
     return lidar[0] - lidar[18]
 
 
+"""Saves the current values of the SAC agent)"""
 def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     torch.save(
         {
@@ -301,12 +318,7 @@ def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     print("Agent saved to", filename)
 
 
-"""Saves the replay buffer"""
-
-
 """Saves the replay buffer using joblib"""
-
-
 def save_replay_buffer(
     replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"
 ):
@@ -315,8 +327,6 @@ def save_replay_buffer(
 
 
 """Loads the saved SAC agent if it exists."""
-
-
 def load_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     checkpoint = torch.load(filename, map_location=device)
     agent.actor.load_state_dict(checkpoint["actor_state_dict"])
@@ -335,8 +345,6 @@ def load_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
 
 
 """Loads the saved replay buffer for the SAC agent using joblib"""
-
-
 def load_replay_buffer(
     replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"
 ):
