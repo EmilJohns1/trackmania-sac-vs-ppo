@@ -1,10 +1,8 @@
-import json
 import pickle
 import random
 import time
 from collections import deque
 
-import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,7 +30,7 @@ class Actor(nn.Module):
         self.mu = nn.Linear(256, act_dim)
         self.log_std = nn.Linear(256, act_dim)
 
-        # Initialize weights and biases
+        # Weight initialization
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -46,11 +44,10 @@ class Actor(nn.Module):
         nn.init.zeros_(self.log_std.bias)
 
     def forward(self, x):
-        x = F.leaky_relu(self.fc1(x), negative_slope=0.01)
-        x = F.leaky_relu(self.fc2(x), negative_slope=0.01)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
         mu = self.mu(x)
         log_std = self.log_std(x).clamp(min=-20, max=2)
-
         std = torch.exp(log_std).clamp(min=1e-6)
         return mu, std
 
@@ -86,7 +83,7 @@ class SACAgent:
         act_dim (int): Dimension of the action space.
     """
 
-    def __init__(self, obs_dim, act_dim, alpha=0.2):
+    def __init__(self, obs_dim, act_dim, alpha=0.1):
         # Define networks
         self.actor = Actor(obs_dim, act_dim).to(device)
         self.critic1 = Critic(obs_dim, act_dim).to(device)
@@ -94,7 +91,7 @@ class SACAgent:
         self.target_critic1 = Critic(obs_dim, act_dim).to(device)
         self.target_critic2 = Critic(obs_dim, act_dim).to(device)
 
-        self.target_entropy = -act_dim
+        self.target_entropy = -act_dim * 0.5
         self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
         self.alpha = self.log_alpha.exp()
@@ -145,9 +142,9 @@ class SACAgent:
         self.critic1_optimizer.step()
         self.critic2_optimizer.step()
 
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=0.5)
 
         new_action, log_prob = self.sample_action(obs)
         q1_new = self.critic1(obs, new_action)
@@ -300,7 +297,7 @@ def calculate_centerline_distance(obs):
 
 
 """Function to plot and save graphs"""
-def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record, filename_prefix="performance"):
+def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record, filename_prefix="graphs/performance"):
     # Plot cumulative reward vs. steps
     plt.figure(figsize=(12, 6))
 
@@ -346,11 +343,10 @@ def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     print("Agent saved to", filename)
 
 
-"""Saves the replay buffer using joblib"""
-def save_replay_buffer(
-    replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"
-):
-    joblib.dump(replay_buffer.buffer, filename)
+"""Saves the replay buffer using pickle"""
+def save_replay_buffer(replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"):
+    with open(filename, 'wb') as f:
+        pickle.dump(replay_buffer.buffer, f)
     print("Replay buffer saved to", filename)
 
 
@@ -372,11 +368,10 @@ def load_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
     print("Agent loaded from", filename)
 
 
-"""Loads the saved replay buffer for the SAC agent using joblib"""
-def load_replay_buffer(
-    replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"
-):
-    replay_buffer.buffer = joblib.load(filename)
+"""Loads the saved replay buffer for the SAC agent using pickle"""
+def load_replay_buffer(replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"):
+    with open(filename, 'rb') as f:
+        replay_buffer.buffer = pickle.load(f)  # Use pickle.load for loading
     print("Replay buffer loaded from", filename)
 
 
@@ -384,7 +379,7 @@ env = get_environment()
 
 agent = SACAgent(85, 3)
 
-BUFFER_SIZE = int(1e6)
+BUFFER_SIZE = int(5e5)
 BATCH_SIZE = 256
 
 replay_buffer = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE)
@@ -432,17 +427,17 @@ for step in range(10000000):  # Total number of training steps
     speed = obs[0]
 
     # 1. Penalize for braking when speed is below 10
-    if speed < 20 and action[1] > 0:
+    if speed < 15 and action[1] > 0:
         reward -= 1  # Penalize for braking at low speed
         action[1] = 0  # Make braking illegal by setting brake action to 0
 
     # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
-    if speed < 20 and action[0] < 0.8:
+    if speed < 15 and action[0] < 0.8:
         reward -= 1  # Penalize for not accelerating at low speed
         action[0] = 1  # Force acceleration (throttle) to 1
 
     # 3. Prevent steering when speed is below 5 (action[2] corresponds to steering)
-    if speed < 20 and action[2] != 0:
+    if speed < 15 and action[2] != 0:
         reward -= 1
         action[2] = 0  # Make steering illegal by setting action[2] to 0
 
@@ -462,7 +457,12 @@ for step in range(10000000):  # Total number of training steps
 
     # Check if any beam is too close to an obstacle
     if np.any(lidar < 100):
-        reward -= 5  # Penalize for proximity to walls
+        reward -= 10  # Penalize for proximity to walls
+        print("crashed into wall")
+
+        if abs(action[2]) < 0.2:
+            reward -= 5
+            print("not enough steering close to wall")
 
     if abs(action[2] - obs[3][2]) > THRESHOLD:
         reward -= 0.5
@@ -480,7 +480,7 @@ for step in range(10000000):  # Total number of training steps
         episode_time = time.time() - episode_start_time
         episode_start_time = time.time()
 
-        if (episode_time < fastest_lap_time) and current_reward > 50 :
+        if (episode_time < fastest_lap_time) and current_reward > 25 :
             fastest_lap_time = episode_time
 
         cumulative_rewards.append(cumulative_reward)
