@@ -11,7 +11,7 @@ After switching to this environment, we observed an improvement in learning, tho
 Additionally, we revised our reward system. We introduced harsher penalties for colliding with or driving close to walls, as the agent had a tendency to drive alongside the walls. We also implemented a penalty for excessive steering. With these changes, we noticed a significant improvement in the agent’s performance, as shown in the video below:
 
 <video width="600" controls>
-  <source src="readme/videos/agent_performance.mp4" type="video/mp4">
+  <source src="readme/videos/agent_progress_1.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 
