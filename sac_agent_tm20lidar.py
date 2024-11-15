@@ -346,7 +346,7 @@ def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
 """Saves the replay buffer using pickle"""
 def save_replay_buffer(replay_buffer, filename="agents/sac_replay_buffer_tm20lidar.pkl"):
     with open(filename, 'wb') as f:
-        pickle.dump(replay_buffer.buffer, f)
+        pickle.dump(replay_buffer.buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
     print("Replay buffer saved to", filename)
 
 
@@ -396,15 +396,16 @@ except FileNotFoundError:
 # Start training loop
 obs, info = env.reset()  # Initial environment reset
 reward = 0
-previous_speed = 0
-THRESHOLD = 1.5
+THRESHOLD = 1.6
 
 cumulative_rewards = []
 fastest_lap_times = []
 steps_record = []
+recent_rewards = []
 
 cumulative_reward = 0
 current_reward = 0
+episode_time = 0
 fastest_lap_time = float("inf")
 episode_start_time = time.time()
 
@@ -427,30 +428,14 @@ for step in range(10000000):  # Total number of training steps
     speed = obs[0]
 
     # 1. Penalize for braking when speed is below 10
-    if speed < 15 and action[1] > 0:
+    if speed < 10 and action[1] > 0:
         reward -= 1  # Penalize for braking at low speed
         action[1] = 0  # Make braking illegal by setting brake action to 0
 
     # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
-    if speed < 15 and action[0] < 0.8:
+    if speed < 10 and action[0] < 0.8:
         reward -= 1  # Penalize for not accelerating at low speed
         action[0] = 1  # Force acceleration (throttle) to 1
-
-    # 3. Prevent steering when speed is below 5 (action[2] corresponds to steering)
-    if speed < 15 and action[2] != 0:
-        reward -= 1
-        action[2] = 0  # Make steering illegal by setting action[2] to 0
-
-    speed_diff = speed - previous_speed
-
-    max_penalty = 5
-    max_reward = 5
-    if speed_diff > 0:
-        reward += min(speed_diff, max_reward)
-    else:
-        reward -= min(-speed_diff, max_penalty)
-
-    previous_speed = speed
 
     # Extract the most recent lidar data from the processed observation
     lidar = obs[1][0]
@@ -466,10 +451,9 @@ for step in range(10000000):  # Total number of training steps
 
     if abs(action[2] - obs[3][2]) > THRESHOLD:
         reward -= 0.5
+        print("too much steering")
 
-    current_reward = reward
-
-    # Take a step in the environment
+    # Take a step in the environment and get updated reward
     obs_next, reward, terminated, truncated, info = env.step(action)
 
     # Accumulate the reward
@@ -477,24 +461,30 @@ for step in range(10000000):  # Total number of training steps
 
     done = terminated or truncated
     if done:
+        # Calculate the total episode time for the lap
         episode_time = time.time() - episode_start_time
         episode_start_time = time.time()
 
-        if (episode_time < fastest_lap_time) and current_reward > 25 :
+        # Check for a new fastest lap time
+        if (episode_time < fastest_lap_time) and reward > 25:
+            print("new fastest lap time")
             fastest_lap_time = episode_time
 
+        # Record cumulative reward and fastest lap time
         cumulative_rewards.append(cumulative_reward)
         fastest_lap_times.append(fastest_lap_time)
         steps_record.append(step)
 
+        # Reset cumulative reward for the next episode
         cumulative_reward = 0
 
         # Reset environment
         obs, info = env.reset()
     else:
-        obs = obs_next  # Update observation for next step
+        # Update observation for the next step
+        obs = obs_next
 
-    # Store experience in replay buffer and update parameters
+        # Store experience in replay buffer and update parameters
     replay_buffer.store(
         processed_obs, action, reward, agent.preprocess_obs(obs_next), done
     )
