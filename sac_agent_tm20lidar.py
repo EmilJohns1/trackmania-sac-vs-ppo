@@ -468,11 +468,11 @@ for step in range(10000000):  # Total number of training steps
 
     # Check if any beam is too close to an obstacle
     if np.any(lidar < 100):
-        reward -= 8  # Penalize for proximity to walls
+        reward -= 7  # Penalize for proximity to walls
         print("crashed into wall")
 
         if abs(action[2]) < 0.2:
-            reward -= 5
+            reward -= 3
             print("not enough steering close to wall")
 
     if abs(action[2] - obs[3][2]) > THRESHOLD:
