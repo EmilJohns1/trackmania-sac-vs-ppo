@@ -10,10 +10,7 @@ After switching to this environment, we observed an improvement in learning, tho
 
 Additionally, we revised our reward system. We introduced harsher penalties for colliding with or driving close to walls, as the agent had a tendency to drive alongside the walls. We also implemented a penalty for excessive steering. With these changes, we noticed a significant improvement in the agent’s performance, as shown in the video below:
 
-<video width="600" controls>
-  <source src="readme/videos/agent_progress_1.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+[![Watch the video](https://img.youtube.com/vi/H-gu15B3E9Y/0.jpg)](https://www.youtube.com/watch?v=H-gu15B3E9Y)
 
 However, over time, the agent’s performance began to degrade. We hypothesized that this was due to the excessive penalty for colliding with walls combined with an insufficient constant time penalty. This caused the agent to drive very slowly to avoid wall collisions, which is illustrated in the video and graph below:
 
