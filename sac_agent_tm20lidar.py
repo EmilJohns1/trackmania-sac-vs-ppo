@@ -296,6 +296,35 @@ def calculate_centerline_distance(obs):
     return lidar[0] - lidar[18]
 
 
+"""Saves the graph data so it doesn't reset every time we rerun our agent"""
+def save_graph_data(cumulative_rewards, fastest_lap_times, steps_record, last_step, filename="graphs/graph_data.pkl"):
+    with open(filename, 'wb') as f:
+        pickle.dump({
+            'cumulative_rewards': cumulative_rewards,
+            'fastest_lap_times': fastest_lap_times,
+            'steps_record': steps_record,
+            'last_step': last_step
+        }, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Graph data saved to {filename}.")
+
+
+"""Loads the graph data"""
+def load_graph_data(filename="graphs/graph_data.pkl"):
+    try:
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+        print(f"Graph data loaded from {filename}.")
+        return (
+            data['cumulative_rewards'],
+            data['fastest_lap_times'],
+            data['steps_record'],
+            data.get('last_step', 0)  # Default to 0 if 'last_step' is not found
+        )
+    except FileNotFoundError:
+        print(f"No graph data found at {filename}, starting fresh.")
+        return [], [], [], 0
+
+
 """Function to plot and save graphs"""
 def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record, filename_prefix="graphs/performance"):
     # Plot cumulative reward vs. steps
@@ -322,6 +351,7 @@ def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_rec
     plt.savefig(f"{filename_prefix}_step_{steps}.png")
     plt.close()
     print(f"Saved graphs at step {steps}.")
+
 
 """Saves the current values of the SAC agent)"""
 def save_agent(agent, filename="agents/sac_agent_tm20lidar.pth"):
@@ -398,10 +428,8 @@ obs, info = env.reset()  # Initial environment reset
 reward = 0
 THRESHOLD = 1.6
 
-cumulative_rewards = []
-fastest_lap_times = []
-steps_record = []
-recent_rewards = []
+cumulative_rewards, fastest_lap_times, steps_record, last_saved_step = load_graph_data()
+steps = last_saved_step
 
 cumulative_reward = 0
 current_reward = 0
@@ -411,8 +439,6 @@ episode_start_time = time.time()
 
 
 for step in range(10000000):  # Total number of training steps
-    time.sleep(0.01)  # Small delay to match environment timing
-
     # Preprocess observation
     processed_obs = agent.preprocess_obs(obs)
 
@@ -442,15 +468,15 @@ for step in range(10000000):  # Total number of training steps
 
     # Check if any beam is too close to an obstacle
     if np.any(lidar < 100):
-        reward -= 10  # Penalize for proximity to walls
+        reward -= 7  # Penalize for proximity to walls
         print("crashed into wall")
 
         if abs(action[2]) < 0.2:
-            reward -= 5
+            reward -= 3
             print("not enough steering close to wall")
 
     if abs(action[2] - obs[3][2]) > THRESHOLD:
-        reward -= 0.5
+        reward -= 1.0
         print("too much steering")
 
     # Take a step in the environment and get updated reward
@@ -497,5 +523,12 @@ for step in range(10000000):  # Total number of training steps
         save_agent(agent, agent_checkpoint_file)
         save_replay_buffer(replay_buffer, replay_buffer_file)
 
+        #Save graph data
+        steps = last_saved_step + step
+
+        save_graph_data(cumulative_rewards, fastest_lap_times, steps_record, steps)
+
         # Plot and save graphs every 10,000 steps
         plot_and_save_graphs(step, cumulative_rewards, fastest_lap_times, steps_record)
+
+        time.sleep(1)
