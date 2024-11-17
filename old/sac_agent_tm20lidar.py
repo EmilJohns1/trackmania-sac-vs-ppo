@@ -401,12 +401,12 @@ def plot_and_save_graphs(steps, cumulative_rewards, lap_times, steps_record, fil
     plt.title("Cumulative Reward vs Steps")
     plt.legend()
 
-    # Fastest Lap Time vs Steps
+    # Lap Time vs Steps
     plt.subplot(1, 2, 2)
-    plt.plot(steps_record, lap_times, label="Fastest Lap Time")
+    plt.plot(steps_record, lap_times, label="Lap Time")
     plt.xlabel("Steps")
-    plt.ylabel("Fastest Lap Time (s)")
-    plt.title("Fastest Lap Time vs Steps")
+    plt.ylabel("Lap Time (s)")
+    plt.title("Lap Time vs Steps")
     plt.legend()
 
     # Save the figure
@@ -535,7 +535,6 @@ for step in range(10000000):
         episode_time = time.time() - episode_start_time
         episode_start_time = time.time()
 
-        # Check for a new fastest lap time
         if modified_reward > 25:
             lap_time = episode_time
 
@@ -569,12 +568,10 @@ for step in range(10000000):
         save_agent(agent, agent_checkpoint_file)
         save_replay_buffer(replay_buffer, replay_buffer_file)
 
-        #Save graph data
         steps = last_saved_step + step
 
-        save_graph_data(cumulative_rewards, fastest_lap_times, steps_record, steps)
+        save_graph_data(cumulative_rewards, lap_times, steps_record, steps)
 
-        # Plot and save graphs every 10,000 steps
-        plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record)
+        plot_and_save_graphs(steps, cumulative_rewards, lap_times, steps_record)
 
         time.sleep(1)
