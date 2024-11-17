@@ -1,0 +1,8 @@
+# Ignore agents directory
+agents/
+
+# Ignore graphs directory
+graphs/
+
+# Ignore virtual environment
+.venv/

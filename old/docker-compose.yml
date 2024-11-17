@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   formatter:
-    build: .
+    build: ..
     container_name: code-formatter
     working_dir: /app
     volumes:
