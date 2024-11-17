@@ -14,7 +14,7 @@ Additionally, we revised our reward system. We introduced harsher penalties for 
 
 However, over time, the agent’s performance began to degrade. We hypothesized that this was due to the excessive penalty for colliding with walls combined with an insufficient constant time penalty. This caused the agent to drive very slowly to avoid wall collisions, which is illustrated in the video and graph below:
 
-![Performance Graph](../readme/graphs/policy_drift.png)
+![Performance Graph](readme/graphs/policy_drift.png)
 [![Watch the video](https://img.youtube.com/vi/WVIzBIZRctk/0.jpg)](https://www.youtube.com/watch?v=WVIzBIZRctk)
 
 To address this, we adjusted the reward system again. We increased the constant time penalty from 0.1 to 0.2 and decreased the collision penalty from -10 to -8. We also increased the penalty for excessive steering from -0.5 to -1.0 to prevent the agent from steering erratically, as observed in earlier runs.
