@@ -15,7 +15,6 @@ def calculate_centerline_distance(obs):
     lidar = np.asarray(obs[1]).reshape(-1)
     return lidar[0] - lidar[18]
 
-
 class Actor(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(Actor, self).__init__()

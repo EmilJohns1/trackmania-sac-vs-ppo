@@ -338,7 +338,7 @@ def train():
     normalizer = StateNormalizer(state_dim)
 
     # Initialize TensorBoard writer
-    writer = SummaryWriter('runs/ppo_trackmania')
+    writer = SummaryWriter('../runs/ppo_trackmania')
 
     # Training parameters
     num_episodes = 1000

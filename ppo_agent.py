@@ -1,329 +1,425 @@
+import os
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
 import numpy as np
-import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from collections import deque
-from torch.utils.tensorboard import SummaryWriter
-
 from torch.distributions import Normal
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
 
-from tmrl import get_environment
+from tmrl import get_environment  # Ensure this function is correctly defined in the tmrl module
 
-# Actor is for continous actions instead of discrete like before
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configuration using dataclass
+@dataclass
+class PPOConfig:
+    device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    state_dim: int = 85
+    action_dim: int = 3
+    batch_size: int = 100
+    actor_lr: float = 0.001
+    critic_lr: float = 0.0005
+    gamma: float = 0.99
+    eps_clip: float = 0.2
+    k_epochs: int = 10
+    lam: float = 0.95
+    entropy_factor: float = 0.05
+    memory_size: int = 20000
+    num_episodes: int = 1000
+    max_steps: int = 1000
+    log_interval: int = 10
+    save_interval: int = 100
+    model_dir: str = "agentsPPO"
+    log_dir: str = "graphsPPO"
+
+# Actor Network
 class Actor(nn.Module):
-    def __init__(self, config, hidden_sizes=[64, 64]):
+    def __init__(self, state_dim: int, action_dim: int):
         super(Actor, self).__init__()
-        layers = []
-        input_dim = config["STATE_DIM"]
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(input_dim, hidden_size))
-            layers.append(nn.ReLU())
-            input_dim = hidden_size
-        self.hidden = nn.Sequential(*layers)
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU()
+        )
+        self.mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Linear(256, action_dim)
+        self._initialize_weights()
 
-        # Output layers for mean and log_std
-        self.mean_head = nn.Linear(input_dim, config["ACTION_DIM"])
-        self.log_std_head = nn.Linear(input_dim, config["ACTION_DIM"])
+    def _initialize_weights(self):
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        nn.init.xavier_uniform_(self.mean.weight)
+        nn.init.zeros_(self.mean.bias)
+        nn.init.xavier_uniform_(self.log_std.weight)
+        nn.init.zeros_(self.log_std.bias)
 
-        # Initialize log_std parameters to small values to prevent too large initial std
-        self.log_std_min = -20
-        self.log_std_max = 2
-
-    def forward(self, state):
-        hidden = self.hidden(state)
-        mean = self.mean_head(hidden)
-        log_std = self.log_std_head(hidden)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+    def forward(self, state: torch.Tensor):
+        x = self.network(state)
+        mean = self.mean(x)
+        log_std = self.log_std(x).clamp(-20, 2)
         std = torch.exp(log_std)
         return mean, std
 
-    def select_action(self, state):
-        mean, std = self.forward(state)
-        dist = Normal(mean, std)
-        z = dist.rsample()
-        action = torch.tanh(z)
-
-        log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-7)
-        log_prob = log_prob.sum(dim=-1)
-
-        entropy = dist.entropy().sum(dim=-1)
-
-        return action.detach().cpu().numpy(), log_prob.detach(), entropy.detach()
-
-
+# Critic Network
 class Critic(nn.Module):
-    def __init__(self, config, hidden_sizes=[64, 64]):
+    def __init__(self, state_dim: int):
         super(Critic, self).__init__()
-        layers = []
-        input_dim = config["STATE_DIM"]
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(input_dim, hidden_size))
-            layers.append(nn.ReLU())
-            input_dim = hidden_size
-        self.hidden = nn.Sequential(*layers)
-        self.value = nn.Linear(input_dim, 1)
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+        self._initialize_weights()
 
-    def forward(self, state):
-        hidden = self.hidden(state)
-        value = self.value(hidden)
-        return value
+    def _initialize_weights(self):
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
 
+    def forward(self, state: torch.Tensor):
+        return self.network(state)
+
+# PPO Agent
 class PPOAgent:
-    def __init__(self, config):
-        super().__init__()
-        self.device = config["DEVICE"]
-        self.gamma = config["GAMMA"]
-        self.eps_clip = config["EPS_CLIP"]
-        self.k_epochs = config["K_EPOCHS"]
-        self.lam = config["LAM"]
-        self.entropy_factor = config["ENTROPY_FACTOR"]
-        self.batch_size = config["BATCH_SIZE"]
+    def __init__(self, config: PPOConfig):
+        self.config = config
+        self.device = config.device
+        self.state_dim = config.state_dim
+        self.action_dim = config.action_dim
+        self.batch_size = config.batch_size
+        self.gamma = config.gamma
+        self.eps_clip = config.eps_clip
+        self.k_epochs = config.k_epochs
+        self.lam = config.lam
+        self.entropy_factor = config.entropy_factor
 
-        state_dim = config["STATE_DIM"]
-        action_dim = config["ACTION_DIM"]
+        self.actor = Actor(self.state_dim, self.action_dim).to(self.device)
+        self.critic = Critic(self.state_dim).to(self.device)
 
-        self.actor = Actor(state_dim, action_dim, hidden_sizes=[64, 64]).to(self.device)
-        self.critic = Critic(state_dim, hidden_sizes=[64, 64]).to(self.device)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.critic_lr)
 
-        self.optimizer_actor = optim.Adam(self.actor.parameters(), lr=config["ACTOR_LR"])
-        self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=config["CRITIC_LR"])
+        self.memory: Dict[str, List[Any]] = {
+            'states': [],
+            'actions': [],
+            'log_probs': [],
+            'rewards': [],
+            'dones': [],
+            'values': []
+        }
 
-        self.memory = deque(maxlen=config["MEMORY_SIZE"])
+        self.obs_mean = np.zeros(self.state_dim, dtype=np.float32)
+        self.obs_var = np.ones(self.state_dim, dtype=np.float32)
+        self.obs_count = 1.0
 
-    #Computes generalized advantage estimation
-    def compute_gae(self, rewards, dones, values, next_values):
-        advantages = []
-        gae = 0
+    def preprocess_obs(self, obs: Any) -> np.ndarray:
+        """Preprocess environment observations for compatibility."""
+        try:
+            if isinstance(obs, tuple) and len(obs) == 4:
+                # Flatten and concatenate all parts of the observation
+                concatenated = np.concatenate([np.asarray(part).flatten() for part in obs])
+                # Pad with zeros if necessary
+                padded = np.pad(
+                    concatenated,
+                    (0, max(0, self.config.state_dim - len(concatenated))),
+                    'constant'
+                )[:self.config.state_dim]
+                return padded.astype(np.float32)
+            else:
+                # Handle unexpected formats by returning a zero array
+                logger.warning("Unexpected observation format. Setting to zeros.")
+                return np.zeros(self.config.state_dim, dtype=np.float32)
+        except Exception as e:
+            logger.error(f"Error in preprocess_obs: {e}")
+            return np.zeros(self.config.state_dim, dtype=np.float32)
+
+    def update_obs_stats(self, obs: np.ndarray):
+        """Update running statistics for observation normalization."""
+        self.obs_count += 1
+        delta = obs - self.obs_mean
+        self.obs_mean += delta / self.obs_count
+        delta2 = obs - self.obs_mean
+        self.obs_var += delta * delta2
+
+    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Normalize observations."""
+        return (obs - self.obs_mean) / (np.sqrt(self.obs_var / self.obs_count) + 1e-8)
+
+    def select_action(self, state: Any) -> (np.ndarray, np.ndarray):
+        """Select action based on current policy."""
+        obs = self.preprocess_obs(state)
+        self.update_obs_stats(obs)
+        norm_obs = self.normalize_obs(obs)
+        state_tensor = torch.FloatTensor(norm_obs).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            mean, std = self.actor(state_tensor)
+        dist = Normal(mean, std)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
+        action_tanh = torch.tanh(action).clamp(-0.999999, 0.999999)  # Prevent exact -1 or 1
+
+        return action_tanh.cpu().numpy()[0], log_prob.cpu().numpy()[0]
+
+    def store_transition(self, state: Any, action: np.ndarray, log_prob: np.ndarray, reward: float, done: bool):
+        """Store transition in memory."""
+        obs = self.preprocess_obs(state)
+        self.update_obs_stats(obs)
+        norm_obs = self.normalize_obs(obs)
+        self.memory['states'].append(norm_obs)
+        self.memory['actions'].append(action)
+        self.memory['log_probs'].append(log_prob)
+        self.memory['rewards'].append(reward)
+        self.memory['dones'].append(done)
+
+    def compute_returns_and_advantages(self, rewards: List[float], dones: List[bool], values: List[float], next_value: float) -> (List[float], List[float]):
+        """Compute returns and Generalized Advantage Estimation (GAE)."""
+        returns, advantages = [], []
+        gae = 0.0
         for step in reversed(range(len(rewards))):
-            delta = rewards[step] + self.gamma * next_values[step] * (1 - dones[step]) - values[step]
-            gae = delta + self.gamma * self.lam * (1 - dones[step]) * gae
+            mask = 1.0 - dones[step]
+            delta = rewards[step] + self.gamma * (values[step + 1] if step + 1 < len(values) else next_value) * mask - values[step]
+            gae = delta + self.gamma * self.lam * mask * gae
+            returns.insert(0, gae + values[step])
             advantages.insert(0, gae)
-        returns = [adv + val for adv, val in zip(advantages, values)]
-        return advantages, returns
+        return returns, advantages
 
-    # Update the actor and critic
     def update(self):
-        # Not enough samples to update!
-        if len(self.memory) < self.batch_size:
+        """Update policy and value networks."""
+        if not self.memory['states']:
+            logger.warning("No transitions to update.")
             return
 
-        # Convert memory to lists
-        states = torch.FloatTensor([m['state'] for m in self.memory]).to(self.device)
-        actions = torch.FloatTensor([m['action'] for m in self.memory]).to(self.device)
-        old_log_probs = torch.FloatTensor([m['log_prob'] for m in self.memory]).to(self.device)
-        rewards = [m['reward'] for m in self.memory]
-        dones = [m['done'] for m in self.memory]
+        # Convert memory to NumPy arrays for efficient tensor creation
+        states = np.array(self.memory['states'], dtype=np.float32)
+        actions = np.array(self.memory['actions'], dtype=np.float32)
+        old_log_probs = np.array(self.memory['log_probs'], dtype=np.float32)
+        rewards = self.memory['rewards']
+        dones = self.memory['dones']
 
         # Compute value estimates
         with torch.no_grad():
-            values = self.critic(states).squeeze().cpu().numpy()
-            next_states = torch.FloatTensor([m['next_state'] for m in self.memory]).to(self.device)
-            next_values = self.critic(next_states).squeeze().cpu().numpy()
+            states_tensor = torch.FloatTensor(states).to(self.device)
+            values = self.critic(states_tensor).squeeze().cpu().numpy()
+            # Compute next value
+            next_state = self.memory['states'][-1]
+            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+            next_value = self.critic(next_state_tensor).item()
+            values = list(values) + [next_value]
 
-        # Compute advantages and returns
-        advantages, returns = self.compute_gae(rewards, dones, values, next_values)
-        advantages = torch.FloatTensor(advantages).to(self.device)
-        returns = torch.FloatTensor(returns).to(self.device)
+        # Compute returns and advantages
+        returns, advantages = self.compute_returns_and_advantages(rewards, dones, values, next_value)
 
         # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 0.00000001)
+        advantages = np.array(advantages, dtype=np.float32)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Shuffle the indices
-        indices = np.arange(len(states))
-        np.random.shuffle(indices)
+        # Convert to tensors
+        returns = torch.FloatTensor(returns).to(self.device)
+        advantages = torch.FloatTensor(advantages).to(self.device)
 
-        for _ in range(self.k_epochs):
-            for start in range(0, len(states), self.batch_size):
-                end = start + self.batch_size
-                minibatch_indices = indices[start:end]
+        # Create dataset and dataloader
+        dataset = TensorDataset(
+            torch.FloatTensor(states).to(self.device),
+            torch.FloatTensor(actions).to(self.device),
+            torch.FloatTensor(old_log_probs).to(self.device),
+            returns,
+            advantages
+        )
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-                minibatch_states = states[minibatch_indices]
-                minibatch_actions = actions[minibatch_indices]
-                minibatch_old_log_probs = old_log_probs[minibatch_indices]
-                minibatch_advantages = advantages[minibatch_indices]
-                minibatch_returns = returns[minibatch_indices]
+        # PPO updates
+        for epoch in range(self.k_epochs):
+            for batch in loader:
+                b_states, b_actions, b_old_log_probs, b_returns, b_advantages = batch
 
-                # Get current policy outputs
-                mean, std = self.actor(minibatch_states)
+                # Forward pass
+                mean, std = self.actor(b_states)
                 dist = Normal(mean, std)
-                z = dist.rsample()
-                actions_tanh = torch.tanh(z)
-                # Calculate log_prob with tanh correction
-                log_prob = dist.log_prob(z) - torch.log(1 - actions_tanh.pow(2) + 0.0000001)
-                log_prob = log_prob.sum(dim=-1)
-
-                # Calculate entropy
+                log_probs = dist.log_prob(b_actions).sum(dim=-1)
                 entropy = dist.entropy().sum(dim=-1)
 
-                # Calculate ratio for clipping
-                ratios = torch.exp(log_prob - minibatch_old_log_probs)
-
-                # Surrogate loss
-                surr1 = ratios * minibatch_advantages
-                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * minibatch_advantages
+                # PPO objective
+                ratios = torch.exp(log_probs - b_old_log_probs.squeeze())
+                surr1 = ratios * b_advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * b_advantages
                 actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_factor * entropy.mean()
+                critic_loss = F.mse_loss(self.critic(b_states).squeeze(), b_returns)
 
-                # Update Actor
-                self.optimizer_actor.zero_grad()
+                # Backward pass and optimization
+                self.actor_optimizer.zero_grad()
                 actor_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                self.optimizer_actor.step()
+                self.actor_optimizer.step()
 
-                # Critic loss
-                value = self.critic(minibatch_states).squeeze()
-                critic_loss = nn.MSELoss()(value, minibatch_returns)
-
-                # Update Critic
-                self.optimizer_critic.zero_grad()
+                self.critic_optimizer.zero_grad()
                 critic_loss.backward()
-                nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-                self.optimizer_critic.step()
+                self.critic_optimizer.step()
 
         # Clear memory after update
-        self.memory.clear()
+        self.reset_memory()
+        logger.debug("Agent updated successfully.")
 
+    def reset_memory(self):
+        """Clear memory buffers."""
+        self.memory = {
+            'states': [],
+            'actions': [],
+            'log_probs': [],
+            'rewards': [],
+            'dones': [],
+            'values': []
+        }
 
-class StateNormalizer:
-    def __init__(self, state_dim):
-        self.state_dim = state_dim
-        self.mean = np.zeros(state_dim)
-        self.var = np.ones(state_dim)
-        self.count = 0
+    def save(self, path: str):
+        """Save model checkpoints."""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+        }, path)
+        logger.info(f"Model saved to {path}")
 
-    def update(self, states):
-        batch_mean = np.mean(states, axis=0)
-        batch_var = np.var(states, axis=0)
-        batch_count = len(states)
+    def load(self, path: str):
+        """Load model checkpoints."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        logger.info(f"Model loaded from {path}")
 
-        # Update running mean and variance using Welford's method
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-
-        new_mean = self.mean + delta * batch_count / tot_count
-        new_var = (self.var * self.count + batch_var * batch_count +
-                   delta ** 2 * self.count * batch_count / tot_count) / tot_count
-
-        self.mean = new_mean
-        self.var = new_var
-        self.count = tot_count
-
-    def normalize(self, state):
-        return (state - self.mean) / (np.sqrt(self.var) + 1e-8)
-
-    def save(self, path):
-        with open(path, 'wb') as f:
-            pickle.dump({
-                'mean': self.mean,
-                'var': self.var,
-                'count': self.count
-            }, f)
-        print(f"StateNormalizer saved to {path}")
-
-    def load(self, path):
-        with open(path, 'rb') as f:
-            data = pickle.load(f)
-            self.mean = data['mean']
-            self.var = data['var']
-            self.count = data['count']
-        print(f"StateNormalizer loaded from {path}")
-
-
-def calculate_centerline_distance(obs):
-    lidar = np.asarray(obs[1]).reshape(-1)
-    return lidar[0] - lidar[18]
-
-
+# PPO Trainer
 class PPOTrainer:
-    def __init__(self, config):
-        self.device = config["DEVICE"]
-        self.num_episodes = config["NUM_EPISODES"]
-        self.max_steps = config["MAX_STEPS"]
-        self.log_interval = config["LOG_INTERVAL"]
-        self.save_interval = config["SAVE_INTERVAL"]
-        self.model_dir = config["MODEL_DIR"]
-        self.log_dir = config["LOG_DIR"]
+    def __init__(self, config: PPOConfig):
+        self.config = config
+        self.device = config.device
+        self.writer = SummaryWriter(log_dir=self.config.log_dir)
 
-        self.writer = SummaryWriter(log_dir=self.log_dir)
+        os.makedirs(self.config.model_dir, exist_ok=True)
+        os.makedirs(self.config.log_dir, exist_ok=True)
 
         self.env = get_environment()
         self.agent = PPOAgent(config)
 
-        self.normalizer = StateNormalizer(config["STATE_DIM"])
+        self.total_rewards: List[float] = []
+        self.best_reward: float = -float('inf')
 
-        self.total_rewards = []
-        self.best_reward = -float('inf')
+        self.episode_numbers: List[int] = []
+        self.avg_rewards: List[float] = []
+
+    def plot_and_save_rewards(self, episode: int, avg_reward: float):
+        """Plot and save average rewards."""
+        self.episode_numbers.append(episode)
+        self.avg_rewards.append(avg_reward)
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.episode_numbers, self.avg_rewards, label='Average Reward')
+        plt.xlabel('Episode')
+        plt.ylabel('Average Reward')
+        plt.title('Average Reward vs Episode')
+        plt.legend()
+        plt.grid(True)
+
+        plots_dir = os.path.join(self.config.log_dir, 'plots')
+        os.makedirs(plots_dir, exist_ok=True)
+        plot_path = os.path.join(plots_dir, f'average_reward_episode_{episode}.png')
+        plt.savefig(plot_path)
+        plt.close()
+        logger.info(f"Saved reward plot to {plot_path}")
 
     def run(self):
-        for episode in range(1, self.num_episodes + 1):
-            state, info = self.env.reset()
-            state = self.normalizer.normalize(state)
+        """Run the training loop."""
+        logger.info("Starting PPO training...")
+        for episode in range(1, self.config.num_episodes + 1):
+            state = self.env.reset()
             episode_reward = 0
-            done = False
-            truncated = False
-            states_batch = []
 
-            for step in range(self.max_steps):
-                action, log_prob, entropy = self.agent.actor.select_action(state)
-                action = np.clip(action, -1.0, 1.0)
+            for step in range(self.config.max_steps):
+                # Select action
+                action, log_prob = self.agent.select_action(state)
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+                done = terminated or truncated
 
-                next_state, reward, done, truncated, info = self.env.step(action)
-
-                next_state_normalized = self.normalizer.normalize(next_state)
-
-                self.agent.store_transition({
-                    'state': state,
-                    'action': action,
-                    'log_prob': log_prob.item(),
-                    'reward': reward,
-                    'next_state': next_state_normalized,
-                    'done': done or truncated,
-                    'entropy': entropy.item(),
-                })
-
-                states_batch.append(state)
-                state = next_state_normalized
+                # Store transition in memory
+                self.agent.store_transition(state, action, log_prob, reward, done)
+                state = next_state
                 episode_reward += reward
 
-                if done or truncated:
+                if done:
                     break
 
-            self.normalizer.update(states_batch)
-            self.agent.update()
+            # Update policy if memory size is exceeded
+            if len(self.agent.memory['states']) >= self.config.memory_size:
+                logger.info(f"Updating policy at episode {episode}")
+                self.agent.update()
+
+            # Track reward
             self.total_rewards.append(episode_reward)
+            avg_reward = np.mean(self.total_rewards[-100:])  # Last 100 episodes
+            self.writer.add_scalar("Reward/Total", episode_reward, episode)
+            self.writer.add_scalar("Reward/Average (last 100)", avg_reward, episode)
+
+            # Per-episode logging
+            logger.info(
+                f"Episode {episode}/{self.config.num_episodes} | "
+                f"Reward: {episode_reward:.2f} | "
+                f"Average Reward (last 100): {avg_reward:.2f}"
+            )
+
+            # Plot and save rewards at log intervals
+            if episode % self.config.log_interval == 0:
+                self.plot_and_save_rewards(episode, avg_reward)
+
+                # Save the best model
+                if avg_reward > self.best_reward:
+                    self.best_reward = avg_reward
+                    best_model_path = os.path.join(self.config.model_dir, 'best_model.pth')
+                    self.agent.save(best_model_path)
+                    logger.info(f"New best model saved to {best_model_path}")
+
+            # Save model checkpoints at save intervals
+            if episode % self.config.save_interval == 0:
+                model_path = os.path.join(self.config.model_dir, f"ppo_episode_{episode}.pt")
+                self.agent.save(model_path)
+                logger.info(f"Model checkpoint saved to {model_path}")
+
+        # Final plotting if needed
+        if self.config.num_episodes % self.config.log_interval != 0:
+            last_avg_reward = np.mean(self.total_rewards[-(self.config.num_episodes % self.config.log_interval):])
+            self.plot_and_save_rewards(self.config.num_episodes, last_avg_reward)
 
         self.writer.close()
         self.env.close()
+        logger.info("PPO training completed.")
 
-
+# Training function
 def train_ppo():
-    config = {
-        "DEVICE": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        "STATE_DIM": 85,
-        "ACTION_DIM": 3,
-        "BATCH_SIZE": 200,
-        "ACTOR_LR": 0.001,
-        "CRITIC_LR": 0.0005,
-        "GAMMA": 0.99,
-        "EPS_CLIP": 0.2,
-        "K_EPOCHS": 10,
-        "LAM": 0.95,
-        "ENTROPY_FACTOR": 0.02,
-        "MEMORY_SIZE": 20000,
-
-        "NUM_EPISODES": 1000,
-        "MAX_STEPS": 1000,
-        "LOG_INTERVAL": 10,
-        "SAVE_INTERVAL": 100,
-
-        "MODEL_DIR": "agentsPPO",
-        "LOG_DIR": "graphsPPO",
-    }
-
+    """Initialize and run the PPO trainer."""
+    config = PPOConfig()
     trainer = PPOTrainer(config)
     trainer.run()
-
 
 if __name__ == "__main__":
     train_ppo()
