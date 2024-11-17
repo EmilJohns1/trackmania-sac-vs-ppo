@@ -1,16 +1,15 @@
-from dataclasses import field, dataclass
-
-import numpy as np
 import random
 import time
+from collections import deque
+from dataclasses import dataclass, field
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-
-from collections import deque
-
+import torch.optim as optim
 from tmrl import get_environment
+
 
 @dataclass
 class SACConfig:
@@ -327,6 +326,15 @@ class SACTrainer:
         self.agent = SACAgent(config)
         self.replay_buffer = ReplayBuffer(config)
 
+    def apply_penalties(self, obs, action):
+        speed = obs[0]
+
+        if speed < 10 and abs(action[1]) > 0 and abs(action[2]) < 0.6:
+            action[1] = 0
+
+        if speed < 10 and action[0] < 0.9 and abs(action[2]) < 0.6:
+            action[0] = 1.0
+
     def run(self):
         cumulative_reward = 0
         lap_time = 0
@@ -346,6 +354,8 @@ class SACTrainer:
                 torch.tensor(processed_obs, dtype=torch.float32).unsqueeze(0).to(self.device)
             )
             action = act.cpu().detach().numpy().flatten()
+
+            self.apply_penalties(obs, action)
 
             obs_next, reward, terminated, truncated, info = self.env.step(action)
             cumulative_reward += reward
