@@ -360,11 +360,11 @@ def calculate_centerline_distance(obs):
 
 
 """Saves the graph data so it doesn't reset every time we rerun our agent"""
-def save_graph_data(cumulative_rewards, fastest_lap_times, steps_record, last_step, filename="graphs/graph_data.pkl"):
+def save_graph_data(cumulative_rewards, lap_times, steps_record, last_step, filename="graphs/graph_data.pkl"):
     with open(filename, 'wb') as f:
         pickle.dump({
             'cumulative_rewards': cumulative_rewards,
-            'fastest_lap_times': fastest_lap_times,
+            'lap_times': lap_times,
             'steps_record': steps_record,
             'last_step': last_step
         }, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -379,7 +379,7 @@ def load_graph_data(filename="graphs/graph_data.pkl"):
         print(f"Graph data loaded from {filename}.")
         return (
             data['cumulative_rewards'],
-            data['fastest_lap_times'],
+            data['lap_times'],
             data['steps_record'],
             data.get('last_step', 0)  # Default to 0 if 'last_step' is not found
         )
@@ -389,7 +389,7 @@ def load_graph_data(filename="graphs/graph_data.pkl"):
 
 
 """Function to plot and save graphs"""
-def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record, filename_prefix="graphs/performance"):
+def plot_and_save_graphs(steps, cumulative_rewards, lap_times, steps_record, filename_prefix="graphs/performance"):
     # Plot cumulative reward vs. steps
     plt.figure(figsize=(12, 6))
 
@@ -403,7 +403,7 @@ def plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_rec
 
     # Fastest Lap Time vs Steps
     plt.subplot(1, 2, 2)
-    plt.plot(steps_record, fastest_lap_times, label="Fastest Lap Time")
+    plt.plot(steps_record, lap_times, label="Fastest Lap Time")
     plt.xlabel("Steps")
     plt.ylabel("Fastest Lap Time (s)")
     plt.title("Fastest Lap Time vs Steps")
@@ -491,14 +491,14 @@ obs, info = env.reset()  # Initial environment reset
 reward = 0
 THRESHOLD = 1.8
 
-cumulative_rewards, fastest_lap_times, steps_record, last_saved_step = load_graph_data()
+cumulative_rewards, lap_times, steps_record, last_saved_step = load_graph_data()
 steps = last_saved_step
 
 cumulative_reward = 0
 current_reward = 0
 modified_reward = 0
 episode_time = 0
-fastest_lap_time = float("inf")
+lap_time = 0
 episode_start_time = time.time()
 
 
@@ -536,13 +536,12 @@ for step in range(10000000):
         episode_start_time = time.time()
 
         # Check for a new fastest lap time
-        if (episode_time < fastest_lap_time) and modified_reward > 25:
-            print("new fastest lap time")
-            fastest_lap_time = episode_time
+        if modified_reward > 25:
+            lap_time = episode_time
 
         # Record cumulative reward and fastest lap time
         cumulative_rewards.append(cumulative_reward)
-        fastest_lap_times.append(fastest_lap_time)
+        lap_times.append(lap_time)
         steps_record.append(step)
 
         # Reset cumulative reward for the next episode
