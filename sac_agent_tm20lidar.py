@@ -93,12 +93,12 @@ class SACAgent:
 
         self.target_entropy = -act_dim * 0.5
         self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-4)
         self.alpha = self.log_alpha.exp()
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=3e-4)
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=3e-4)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=1e-4)
+        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=1e-4)
 
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
@@ -107,6 +107,11 @@ class SACAgent:
         self.obs_mean = np.zeros(obs_dim)
         self.obs_var = np.ones(obs_dim)
         self.obs_count = 1e-5  # Small constant to prevent division by zero
+
+        self.ewc_lambda = 1000.0  # Regularization strength for EWC
+        self.fisher_matrix = {}
+        self.prev_params = {}
+
 
     """Action sampling method for the SAC agent"""
     def sample_action(self, obs):
@@ -121,9 +126,10 @@ class SACAgent:
 
         return action, log_prob.sum(1, keepdim=True)
 
+
     """Method to update the parameters of the SAC agent"""
     def update_parameters(self, replay_buffer, gamma=0.99, tau=0.005):
-        obs, action, reward, next_obs, done = replay_buffer.sample()
+        obs, action, reward, next_obs, done = replay_buffer.sample(replay_buffer.batch_size)
         with torch.no_grad():
             next_action, log_prob = self.sample_action(next_obs)
             target_q1 = self.target_critic1(next_obs, next_action)
@@ -255,6 +261,59 @@ class SACAgent:
 
         return torch.tensor(normalized_obs, dtype=torch.float32).to(device)
 
+    def compute_fisher_matrix(self, replay_buffer, num_samples=100):
+        """
+        Computes the Fisher Information Matrix (FIM) using the replay buffer.
+        Args:
+            replay_buffer: Replay buffer to sample data from.
+            num_samples: Number of samples to use for computing FIM.
+        """
+        self.fisher_matrix = {}
+        self.prev_params = {}
+
+        # Ensure there are enough samples in the buffer for the specified number of samples
+        if replay_buffer.size() >= num_samples:
+            for i in range(num_samples):
+                # Dynamically adjust batch size to be less than or equal to buffer size
+                batch_size = min(replay_buffer.batch_size, replay_buffer.size())
+
+                # Sample a batch from the buffer
+                obs, action, _, _, _ = replay_buffer.sample(batch_size)  # Sample a batch of adjusted size
+                mu, std = self.actor(obs)
+                dist = torch.distributions.Normal(mu, std)
+                log_probs = dist.log_prob(action).sum(dim=1)
+
+                # Compute gradients for the log probabilities
+                self.actor_optimizer.zero_grad()
+                log_probs.mean().backward(retain_graph=True)
+
+                for name, param in self.actor.named_parameters():
+                    if param.grad is not None:
+                        if name not in self.fisher_matrix:
+                            self.fisher_matrix[name] = param.grad.data.clone().pow(2)
+                        else:
+                            self.fisher_matrix[name] += param.grad.data.clone().pow(2)
+
+            # Normalize Fisher matrix and store parameters
+            for name, param in self.actor.named_parameters():
+                if name in self.fisher_matrix:
+                    self.fisher_matrix[name] /= num_samples
+                self.prev_params[name] = param.data.clone()
+
+
+    def ewc_loss(self):
+        """
+        Computes the EWC loss to regularize updates.
+        Returns:
+            Regularization loss term for EWC.
+        """
+        loss = 0.0
+        for name, param in self.actor.named_parameters():
+            if name in self.fisher_matrix:
+                fisher_value = self.fisher_matrix[name]
+                prev_param_value = self.prev_params[name]
+                loss += (fisher_value * (param - prev_param_value).pow(2)).sum()
+        return self.ewc_lambda * loss
 
 class ReplayBuffer:
     """
@@ -269,13 +328,17 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
 
+
     """Stores a new experience tuple in the replay buffer"""
     def store(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
 
+
     """Samples a mini-batch of experiences from the replay buffer"""
-    def sample(self):
-        batch = random.sample(self.buffer, self.batch_size)
+    def sample(self, batch_size):
+        if self.batch_size < batch_size:
+            batch_size = self.batch_size
+        batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = map(np.array, zip(*batch))
         return (
             torch.tensor(states, dtype=torch.float32).to(device),
@@ -410,7 +473,7 @@ env = get_environment()
 agent = SACAgent(85, 3)
 
 BUFFER_SIZE = int(5e5)
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 
 replay_buffer = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE)
 
@@ -426,64 +489,45 @@ except FileNotFoundError:
 # Start training loop
 obs, info = env.reset()  # Initial environment reset
 reward = 0
-THRESHOLD = 1.6
+THRESHOLD = 1.8
 
 cumulative_rewards, fastest_lap_times, steps_record, last_saved_step = load_graph_data()
 steps = last_saved_step
 
 cumulative_reward = 0
 current_reward = 0
+modified_reward = 0
 episode_time = 0
 fastest_lap_time = float("inf")
 episode_start_time = time.time()
 
 
-for step in range(10000000):  # Total number of training steps
-    # Preprocess observation
+for step in range(10000000):
     processed_obs = agent.preprocess_obs(obs)
 
-    # Convert processed observation to tensor for action sampling
     act, log_prob = agent.sample_action(
         torch.tensor(processed_obs, dtype=torch.float32).unsqueeze(0).to(device)
     )
     action = (
         act.cpu().detach().numpy().flatten()
-    )  # Convert action to numpy for environment
+    )
 
-    # Get the speed from the observation (obs[0])
     speed = obs[0]
 
-    # 1. Penalize for braking when speed is below 10
-    if speed < 10 and action[1] > 0:
-        reward -= 1  # Penalize for braking at low speed
-        action[1] = 0  # Make braking illegal by setting brake action to 0
+    modified_reward = 0
 
-    # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
-    if speed < 10 and action[0] < 0.8:
-        reward -= 1  # Penalize for not accelerating at low speed
-        action[0] = 1  # Force acceleration (throttle) to 1
+    if speed < 10 and abs(action[1]) > 0 and abs(action[2]) < 0.6:
+        action[1] = 0
 
-    # Extract the most recent lidar data from the processed observation
-    lidar = obs[1][0]
-
-    # Check if any beam is too close to an obstacle
-    if np.any(lidar < 100):
-        reward -= 7  # Penalize for proximity to walls
-        print("crashed into wall")
-
-        if abs(action[2]) < 0.2:
-            reward -= 3
-            print("not enough steering close to wall")
-
-    if abs(action[2] - obs[3][2]) > THRESHOLD:
-        reward -= 1.0
-        print("too much steering")
+    if speed < 10 and action[0] < 0.9 and abs(action[2]) < 0.6:
+        action[0] = 1.0
 
     # Take a step in the environment and get updated reward
     obs_next, reward, terminated, truncated, info = env.step(action)
 
     # Accumulate the reward
-    cumulative_reward += reward
+    modified_reward += reward
+    cumulative_reward += modified_reward
 
     done = terminated or truncated
     if done:
@@ -492,7 +536,7 @@ for step in range(10000000):  # Total number of training steps
         episode_start_time = time.time()
 
         # Check for a new fastest lap time
-        if (episode_time < fastest_lap_time) and reward > 25:
+        if (episode_time < fastest_lap_time) and modified_reward > 25:
             print("new fastest lap time")
             fastest_lap_time = episode_time
 
@@ -504,6 +548,9 @@ for step in range(10000000):  # Total number of training steps
         # Reset cumulative reward for the next episode
         cumulative_reward = 0
 
+        # Compute and store the Fisher matrix for EWC after each episode/task
+        agent.compute_fisher_matrix(replay_buffer)
+
         # Reset environment
         obs, info = env.reset()
     else:
@@ -512,7 +559,7 @@ for step in range(10000000):  # Total number of training steps
 
         # Store experience in replay buffer and update parameters
     replay_buffer.store(
-        processed_obs, action, reward, agent.preprocess_obs(obs_next), done
+        processed_obs, action, modified_reward, agent.preprocess_obs(obs_next), done
     )
 
     if replay_buffer.size() >= BATCH_SIZE:
@@ -529,6 +576,6 @@ for step in range(10000000):  # Total number of training steps
         save_graph_data(cumulative_rewards, fastest_lap_times, steps_record, steps)
 
         # Plot and save graphs every 10,000 steps
-        plot_and_save_graphs(step, cumulative_rewards, fastest_lap_times, steps_record)
+        plot_and_save_graphs(steps, cumulative_rewards, fastest_lap_times, steps_record)
 
         time.sleep(1)
