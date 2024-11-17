@@ -1,3 +1,5 @@
+from dataclasses import field, dataclass
+
 import numpy as np
 import random
 import time
@@ -10,6 +12,18 @@ from collections import deque
 
 from tmrl import get_environment
 
+@dataclass
+class SACConfig:
+    DEVICE: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    MAX_STEPS: int = 10000000
+    STEP_DELAY: float = 0.01
+    OBSERVATION_SPACE: int = 85
+    ACTION_SPACE: int = 3
+    ALPHA: float = 0.1
+    BUFFER_SIZE: int = int(5e5)
+    BATCH_SIZE: int = 256
+    GAMMA: int = 0.995
+    TAU: int = 0.005
 
 def calculate_centerline_distance(obs):
     lidar = np.asarray(obs[1]).reshape(-1)
@@ -60,20 +74,21 @@ class Critic(nn.Module):
 
 
 class SACAgent:
-    def __init__(self, config):
-        device = self.device = config["DEVICE"]
-        obs_dim = config["OBSERVATION_SPACE"]
-        act_dim = config["ACTION_SPACE"]
-        alpha = config["ALPHA"]
+    def __init__(self, config: SACConfig):
+        self.config = config
+        self.device = config.DEVICE
+        self.obs_dim = config.OBSERVATION_SPACE
+        self.act_dim = config.ACTION_SPACE
+        self.alpha = config.ALPHA
 
-        self.actor = Actor(obs_dim, act_dim).to(device)
-        self.critic1 = Critic(obs_dim, act_dim).to(device)
-        self.critic2 = Critic(obs_dim, act_dim).to(device)
-        self.target_critic1 = Critic(obs_dim, act_dim).to(device)
-        self.target_critic2 = Critic(obs_dim, act_dim).to(device)
+        self.actor = Actor(self.obs_dim, self.act_dim).to(self.device)
+        self.critic1 = Critic(self.obs_dim, self.act_dim).to(self.device)
+        self.critic2 = Critic(self.obs_dim, self.act_dim).to(self.device)
+        self.target_critic1 = Critic(self.obs_dim, self.act_dim).to(self.device)
+        self.target_critic2 = Critic(self.obs_dim, self.act_dim).to(self.device)
 
-        self.target_entropy = -act_dim * 0.5
-        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
+        self.target_entropy = -self.act_dim * 0.5
+        self.log_alpha = torch.tensor(np.log(self.alpha), requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
         self.alpha = self.log_alpha.exp()
 
@@ -84,9 +99,13 @@ class SACAgent:
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
 
-        self.obs_mean = np.zeros(obs_dim)
-        self.obs_var = np.ones(obs_dim)
+        self.obs_mean = np.zeros(self.obs_dim)
+        self.obs_var = np.ones(self.obs_dim)
         self.obs_count = 1e-5
+
+        self.ewc_lambda = 1000.0
+        self.fisher_matrix = {}
+        self.prev_params = {}
 
     def sample_action(self, obs):
         mu, std = self.actor(obs)
@@ -100,8 +119,11 @@ class SACAgent:
 
         return action, log_prob.sum(1, keepdim=True)
 
-    def update_parameters(self, replay_buffer, gamma=0.99, tau=0.005):
+    def update_parameters(self, replay_buffer):
         obs, action, reward, next_obs, done = replay_buffer.sample()
+        gamma = self.config.GAMMA
+        tau = self.config.TAU
+
         with torch.no_grad():
             next_action, log_prob = self.sample_action(next_obs)
             target_q1 = self.target_critic1(next_obs, next_action)
@@ -129,6 +151,7 @@ class SACAgent:
         q2_new = self.critic2(obs, new_action)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (self.alpha * log_prob - q_new).mean()
+        actor_loss += self.ewc_loss()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -153,6 +176,54 @@ class SACAgent:
 
         return reward
 
+    def compute_fisher_matrix(self, replay_buffer, num_samples=100):
+        """
+        Computes the Fisher Information Matrix (FIM) using the replay buffer.
+        Args:
+            replay_buffer: Replay buffer to sample data from.
+            num_samples: Number of samples to use for computing FIM.
+        """
+        self.fisher_matrix = {}
+        self.prev_params = {}
+
+        if replay_buffer.size() >= num_samples:
+            for i in range(num_samples):
+                batch_size = min(replay_buffer.batch_size, replay_buffer.size())
+
+                obs, action, _, _, _ = replay_buffer.sample(batch_size)
+                mu, std = self.actor(obs)
+                dist = torch.distributions.Normal(mu, std)
+                log_probs = dist.log_prob(action).sum(dim=1)
+
+                self.actor_optimizer.zero_grad()
+                log_probs.mean().backward(retain_graph=True)
+
+                for name, param in self.actor.named_parameters():
+                    if param.grad is not None:
+                        if name not in self.fisher_matrix:
+                            self.fisher_matrix[name] = param.grad.data.clone().pow(2)
+                        else:
+                            self.fisher_matrix[name] += param.grad.data.clone().pow(2)
+
+            for name, param in self.actor.named_parameters():
+                if name in self.fisher_matrix:
+                    self.fisher_matrix[name] /= num_samples
+                self.prev_params[name] = param.data.clone()
+
+    def ewc_loss(self):
+        """
+        Computes the EWC loss to regularize updates.
+        Returns:
+            Regularization loss term for EWC.
+        """
+        loss = 0.0
+        for name, param in self.actor.named_parameters():
+            if name in self.fisher_matrix:
+                fisher_value = self.fisher_matrix[name]
+                prev_param_value = self.prev_params[name]
+                loss += (fisher_value * (param - prev_param_value).pow(2)).sum()
+        return self.ewc_lambda * loss
+
     def update_obs_stats(self, obs):
         self.obs_count += 1
         delta = obs - self.obs_mean
@@ -161,28 +232,24 @@ class SACAgent:
         self.obs_var += delta * delta2
 
     def preprocess_obs(self, obs):
-        # Handle the case where obs has an empty dictionary as the second element
         if (
             isinstance(obs, tuple)
             and len(obs) > 1
             and isinstance(obs[1], dict)
             and not obs[1]
         ):
-            obs_data = obs[0]  # Use the first element directly if there's an empty dict
+            obs_data = obs[0]
         else:
-            obs_data = obs  # Otherwise, use the entire tuple as expected
+            obs_data = obs
 
-        expected_obs_size = 85
+        expected_obs_size = self.obs_dim
 
-        # Check if obs_data contains the expected components for normal processing
         if isinstance(obs_data, tuple) and len(obs_data) == 4:
-            # Process each component of the observation data
             speed = np.asarray(obs_data[0]).flatten()
-            lidar = np.asarray(obs_data[1]).reshape(-1)  # Flatten it to shape (76,)
-            prev_action_1 = np.asarray(obs_data[2]).flatten()  # (3,)
-            prev_action_2 = np.asarray(obs_data[3]).flatten()  # (3,)
+            lidar = np.asarray(obs_data[1]).reshape(-1)
+            prev_action_1 = np.asarray(obs_data[2]).flatten()
+            prev_action_2 = np.asarray(obs_data[3]).flatten()
 
-            # Check for NaNs
             if (
                 np.any(np.isnan(speed))
                 or np.any(np.isnan(lidar))
@@ -191,14 +258,12 @@ class SACAgent:
             ):
                 print("NaN detected in observation components")
 
-            # Compute the current and next distances to the centerline
             current_centerline_distance = calculate_centerline_distance(obs)
             next_lidar = np.asarray(
                 obs_data[1][1]
-            )  # Assuming the next lidar scan is here
+            )
             next_centerline_distance = next_lidar[0] - next_lidar[18]
 
-            # Concatenate all components into a single observation vector
             concatenated_obs = np.concatenate(
                 [
                     speed,
@@ -209,22 +274,16 @@ class SACAgent:
                 ]
             )
 
-            # Ensure the observation has the expected size by padding if necessary
             if concatenated_obs.shape[0] != expected_obs_size:
-                print("Observation size mismatch. Padding or truncating to fit.")
                 concatenated_obs = np.pad(
                     concatenated_obs,
                     (0, max(0, expected_obs_size - concatenated_obs.shape[0])),
                 )[:expected_obs_size]
         else:
-            # Handle the unexpected structure case by returning a zero-filled tensor
-            print("Unexpected observation structure:", obs_data)
             concatenated_obs = np.zeros(expected_obs_size)
 
-        # Update statistics with the new observation
         self.update_obs_stats(concatenated_obs)
 
-        # Normalize using the current mean and std deviation
         normalized_obs = (concatenated_obs - self.obs_mean) / np.sqrt(
             self.obs_var / self.obs_count
         )
@@ -233,10 +292,10 @@ class SACAgent:
 
 
 class ReplayBuffer:
-    def __init__(self, config):
-        self.device = config["DEVICE"]
-        self.buffer = deque(maxlen=config["BUFFER_SIZE"])
-        self.batch_size = config["BATCH_SIZE"]
+    def __init__(self, config: SACConfig):
+        self.device = config.DEVICE
+        self.buffer = deque(maxlen=config.BUFFER_SIZE)
+        self.batch_size = config.BATCH_SIZE
 
     def store(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
@@ -257,60 +316,24 @@ class ReplayBuffer:
 
 
 class SACTrainer:
-    def __init__(self, config):
-        self.device = config["DEVICE"]
-        self.max_steps = config["MAX_STEPS"]
-        self.step_delay = config["STEP_DELAY"]
-        self.batch_size = config["BATCH_SIZE"]
+    def __init__(self, config: SACConfig):
+        self.device = config.DEVICE
+        self.max_steps = config.MAX_STEPS
+        self.step_delay = config.STEP_DELAY
+        self.batch_size = config.BATCH_SIZE
 
         self.env = get_environment()
+        self.config = SACConfig()
         self.agent = SACAgent(config)
         self.replay_buffer = ReplayBuffer(config)
 
-
-    def apply_penalties(self, obs, action):
-        reward = 0
-
-        # Get the speed from the observation (obs[0])
-        speed = obs[0]
-
-        # 1. Penalize for braking when speed is below 10
-        if speed < 10 and action[1] > 0:
-            reward -= 1  # Penalize for braking at low speed
-            action[1] = 0  # Make braking illegal by setting brake action to 0
-
-        # 2. Penalize for not accelerating when speed is below 5 (action[0] should be 1)
-        if speed < 10 and action[0] < 0.8:
-            reward -= 1  # Penalize for not accelerating at low speed
-            action[0] = 1  # Force acceleration (throttle) to 1
-
-        # Extract the most recent lidar data from the processed observation
-        lidar = obs[1][0]
-
-        # Check if any beam is too close to an obstacle
-        if np.any(lidar < 100):
-            reward -= 10  # Penalize for proximity to walls
-            print("crashed into wall")
-
-            if abs(action[2]) < 0.2:
-                reward -= 5
-                print("not enough steering close to wall")
-
-        if abs(action[2] - obs[3][2]) > 1.6:
-            reward -= 0.5
-            print("too much steering")
-
-        return reward
-
-
     def run(self):
-        reward = 0
         cumulative_reward = 0
-        fastest_lap_time = float("inf")
+        lap_time = 0
         episode_start_time = time.time()
 
         cumulative_rewards = []
-        fastest_lap_times = []
+        lap_times = []
         steps_record = []
 
         obs, info = self.env.reset()
@@ -324,10 +347,7 @@ class SACTrainer:
             )
             action = act.cpu().detach().numpy().flatten()
 
-            reward_modifier = self.apply_penalties(obs, action)
-
             obs_next, reward, terminated, truncated, info = self.env.step(action)
-            reward += reward_modifier
             cumulative_reward += reward
 
             done = terminated or truncated
@@ -335,15 +355,16 @@ class SACTrainer:
                 episode_time = time.time() - episode_start_time
                 episode_start_time = time.time()
 
-                if (episode_time < fastest_lap_time) and reward > 25:
-                    fastest_lap_time = episode_time
-                    print(f"New fastest lap time: {fastest_lap_time:.2f}s")
+                if float(reward) > 25:
+                    lap_time = episode_time
 
                 cumulative_rewards.append(cumulative_reward)
-                fastest_lap_times.append(fastest_lap_time)
+                lap_times.append(lap_time)
                 steps_record.append(step)
 
                 cumulative_reward = 0
+
+                self.agent.compute_fisher_matrix(self.replay_buffer)
 
                 obs, info = self.env.reset()
             else:
@@ -362,20 +383,9 @@ class SACTrainer:
 
 
 def train_sac():
-    config = {
-        "DEVICE": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        "MAX_STEPS": 10000000,
-        "STEP_DELAY": 0.01,
-        "OBSERVATION_SPACE": 85,
-        "ACTION_SPACE": 3,
-        "ALPHA": 0.1,
-        "BUFFER_SIZE": int(5e5),
-        "BATCH_SIZE": 256,
-    }
-
+    config = SACConfig()
     trainer = SACTrainer(config)
     trainer.run()
-
 
 if __name__ == "__main__":
     train_sac()

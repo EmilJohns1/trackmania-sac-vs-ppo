@@ -93,12 +93,12 @@ class SACAgent:
 
         self.target_entropy = -act_dim * 0.5
         self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-4)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=6e-4)
         self.alpha = self.log_alpha.exp()
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=1e-4)
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=1e-4)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=6e-4)
+        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=6e-4)
+        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=6e-4)
 
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
@@ -157,6 +157,7 @@ class SACAgent:
         q2_new = self.critic2(obs, new_action)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (self.alpha * log_prob - q_new).mean()
+        actor_loss += self.ewc_loss()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
