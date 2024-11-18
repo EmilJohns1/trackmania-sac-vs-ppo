@@ -27,11 +27,11 @@ logger = logging.getLogger("PPO_AGENT")
 @dataclass
 class PPOConfig:
     device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    state_dim: int = 83
-    action_dim: int = 3
-    batch_size: int = 100
-    actor_lr: float = 3e-4
-    critic_lr: float = 3e-4
+    observation_space: int = 83
+    action_space: int = 3
+    batch_size: int = 256
+    actor_lr: float = 5e-4
+    critic_lr: float = 1e-3
     gamma: float = 0.99
     eps_clip: float = 0.2
     k_epochs: int = 10
@@ -39,7 +39,7 @@ class PPOConfig:
     entropy_factor: float = 0.05
     memory_size: int = 20000
     num_episodes: int = 1000
-    max_steps: int = 1000
+    max_steps: int = 2500
     log_interval: int = 10
     save_interval: int = 100
     model_dir: str = "agentsPPO"
@@ -50,11 +50,11 @@ class PPOConfig:
     norm_advantages: bool = True
 
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+    def __init__(self, observation_space: int, action_space: int, hidden_dim: int = 256):
         super(Actor, self).__init__()
         # Define dimensions
         lidar_dim = 72
-        other_dim = state_dim - lidar_dim
+        other_dim = observation_space - lidar_dim
 
         # Lidar Subnetwork
         self.lidar_net = nn.Sequential(
@@ -80,8 +80,8 @@ class Actor(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
-        self.mean = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Linear(hidden_dim, action_dim)
+        self.mean = nn.Linear(hidden_dim, action_space)
+        self.log_std = nn.Linear(hidden_dim, action_space)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -116,11 +116,11 @@ class Actor(nn.Module):
         return mean, std
 
 class Critic(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 256):
+    def __init__(self, observation_space: int, hidden_dim: int = 256):
         super(Critic, self).__init__()
         # Define dimensions based on your observation structure
         lidar_dim = 72
-        other_dim = state_dim - lidar_dim
+        other_dim = observation_space - lidar_dim
 
         # Lidar Subnetwork
         self.lidar_net = nn.Sequential(
@@ -180,8 +180,8 @@ class PPOAgent:
     def __init__(self, config: PPOConfig):
         self.config = config
         self.device = config.device
-        self.state_dim = config.state_dim
-        self.action_dim = config.action_dim
+        self.observation_space = config.observation_space
+        self.action_space = config.action_space
         self.batch_size = config.batch_size
         self.gamma = config.gamma
         self.eps_clip = config.eps_clip
@@ -189,8 +189,8 @@ class PPOAgent:
         self.lam = config.lam
         self.entropy_factor = config.entropy_factor
 
-        self.actor = Actor(self.state_dim, self.action_dim).to(self.device)
-        self.critic = Critic(self.state_dim).to(self.device)
+        self.actor = Actor(self.observation_space, self.action_space).to(self.device)
+        self.critic = Critic(self.observation_space).to(self.device)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.actor_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.critic_lr)
@@ -204,8 +204,8 @@ class PPOAgent:
             'values': []
         }
 
-        self.obs_mean = np.zeros(self.state_dim, dtype=np.float32)
-        self.obs_var = np.ones(self.state_dim, dtype=np.float32)
+        self.obs_mean = np.zeros(self.observation_space, dtype=np.float32)
+        self.obs_var = np.ones(self.observation_space, dtype=np.float32)
         self.obs_count = 1.0
 
     def preprocess_obs(self, obs: Any) -> np.ndarray:
@@ -217,16 +217,16 @@ class PPOAgent:
                 concatenated = np.concatenate([np.asarray(part).flatten() for part in obs])
                 padded = np.pad(
                     concatenated,
-                    (0, max(0, self.config.state_dim - len(concatenated))),
+                    (0, max(0, self.config.observation_space - len(concatenated))),
                     'constant'
-                )[:self.config.state_dim]
+                )[:self.config.observation_space]
                 return padded.astype(np.float32)
             else:
                 logger.warning("Unexpected observation format. Setting to zeros.")
-                return np.zeros(self.config.state_dim, dtype=np.float32)
+                return np.zeros(self.config.observation_space, dtype=np.float32)
         except Exception as e:
             logger.error(f"Error in preprocess_obs: {e}")
-            return np.zeros(self.config.state_dim, dtype=np.float32)
+            return np.zeros(self.config.observation_space, dtype=np.float32)
 
     def update_obs_stats(self, obs: np.ndarray):
         self.obs_count += 1
@@ -416,7 +416,7 @@ class PPOTrainer:
         self.steps_record: List[int] = []
         self.cumulative_steps: int = 0  # Total steps across episodes
 
-    def plot_and_save_graphs(self, steps: int, cumulative_rewards: List[float], lap_times: List[float], steps_record: List[int], filename_prefix: str = "graphs/sac/performance"):
+    def plot_and_save_graphs(self, steps: int, cumulative_rewards: List[float], lap_times: List[float], steps_record: List[int], filename_prefix: str = "graphsPPO/performance"):
         plt.figure(figsize=(12, 6))
 
         # Subplot 1: Cumulative Reward vs Steps
@@ -540,8 +540,6 @@ class PPOTrainer:
 
         self.env.close()
         logger.info("PPO training completed.")
-
-
 
 def train_ppo():
     config = PPOConfig()
