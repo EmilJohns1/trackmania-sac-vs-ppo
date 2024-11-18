@@ -1,4 +1,5 @@
 import os
+import pickle
 import logging
 import time
 from dataclasses import dataclass, field
@@ -9,12 +10,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tmrl import get_environment
 from torch.distributions import Normal
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+from tmrl import get_environment
 
-# Configure logging
+
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
@@ -24,39 +25,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PPO_AGENT")
 
+
 @dataclass
 class PPOConfig:
-    device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    observation_space: int = 83
-    action_space: int = 3
-    batch_size: int = 256
-    actor_lr: float = 5e-4
-    critic_lr: float = 1e-3
-    gamma: float = 0.99
-    eps_clip: float = 0.2
-    k_epochs: int = 10
-    lam: float = 0.95
-    entropy_factor: float = 0.05
-    memory_size: int = 20000
-    num_episodes: int = 1000
-    max_steps: int = 2500
-    log_interval: int = 10
-    save_interval: int = 100
-    model_dir: str = "agentsPPO"
-    log_dir: str = "graphsPPO"
-    avg_ray: float = 400
-    critic_coef: float = 0.5
-    grad_clip_val: float = 0.1
-    norm_advantages: bool = True
+    DEVICE: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    OBSERVATION_SPACE: int = 83
+    ACTION_SPACE: int = 3
+    BATCH_SIZE: int = 512
+    ACTOR_LR: float = 0.00003
+    CRITIC_LR: float = 0.00005
+    GAMMA: float = 0.99
+    EPS_CLIP: float = 0.2
+    K_EPOCHS: int = 10
+    LAM: float = 0.95
+    ENTROPY_FACTOR: float = 0.01
+    MEMORY_SIZE: int = 20000
+    NUM_EPISODES: int = 10000
+    MAX_STEPS: int = 2500
+    LOG_INTERVAL: int = 10
+    SAVE_INTERVAL: int = 100
+    CRITIC_COEF: float = 0.5
+    GRAD_CLIP_VAL: float = 0.1
+    NORM_ADVANTAGES: bool = True
+
 
 class Actor(nn.Module):
-    def __init__(self, observation_space: int, action_space: int, hidden_dim: int = 256):
+    def __init__(self, obs_dim, act_dim, hidden_dim=256):
         super(Actor, self).__init__()
-        # Define dimensions
         lidar_dim = 72
-        other_dim = observation_space - lidar_dim
+        other_dim = obs_dim - lidar_dim
 
-        # Lidar Subnetwork
         self.lidar_net = nn.Sequential(
             nn.Linear(lidar_dim, hidden_dim),
             nn.LeakyReLU(negative_slope=0.01),
@@ -64,7 +62,6 @@ class Actor(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
-        # Other Sensors Subnetwork
         self.other_net = nn.Sequential(
             nn.Linear(other_dim, hidden_dim // 2),
             nn.LeakyReLU(negative_slope=0.01),
@@ -72,7 +69,6 @@ class Actor(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
-        # Combined Network
         self.combined_net = nn.Sequential(
             nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
             nn.LeakyReLU(negative_slope=0.01),
@@ -80,8 +76,8 @@ class Actor(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
-        self.mean = nn.Linear(hidden_dim, action_space)
-        self.log_std = nn.Linear(hidden_dim, action_space)
+        self.mean = nn.Linear(hidden_dim, act_dim)
+        self.log_std = nn.Linear(hidden_dim, act_dim)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -102,7 +98,7 @@ class Actor(nn.Module):
         nn.init.xavier_uniform_(self.log_std.weight)
         nn.init.zeros_(self.log_std.bias)
 
-    def forward(self, state: torch.Tensor):
+    def forward(self, state):
         lidar_dim = 72
         lidar = state[:, :lidar_dim]
         other = state[:, lidar_dim:]
@@ -115,14 +111,13 @@ class Actor(nn.Module):
         std = torch.exp(log_std)
         return mean, std
 
-class Critic(nn.Module):
-    def __init__(self, observation_space: int, hidden_dim: int = 256):
-        super(Critic, self).__init__()
-        # Define dimensions based on your observation structure
-        lidar_dim = 72
-        other_dim = observation_space - lidar_dim
 
-        # Lidar Subnetwork
+class Critic(nn.Module):
+    def __init__(self, obs_dim, hidden_dim=256):
+        super(Critic, self).__init__()
+        lidar_dim = 72
+        other_dim = obs_dim - lidar_dim
+
         self.lidar_net = nn.Sequential(
             nn.Linear(lidar_dim, hidden_dim),
             nn.LeakyReLU(negative_slope=0.01),
@@ -130,7 +125,6 @@ class Critic(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
-        # Other Sensors Subnetwork
         self.other_net = nn.Sequential(
             nn.Linear(other_dim, hidden_dim // 2),
             nn.LeakyReLU(negative_slope=0.01),
@@ -138,7 +132,6 @@ class Critic(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
-        # Combined Network
         self.combined_net = nn.Sequential(
             nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
             nn.LeakyReLU(negative_slope=0.01),
@@ -165,8 +158,8 @@ class Critic(nn.Module):
         nn.init.xavier_uniform_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
 
-    def forward(self, state: torch.Tensor):
-        lidar_dim = 72  # Adjust based on your observation structure
+    def forward(self, state):
+        lidar_dim = 72
         lidar = state[:, :lidar_dim]
         other = state[:, lidar_dim:]
         lidar_features = self.lidar_net(lidar)
@@ -176,24 +169,25 @@ class Critic(nn.Module):
         value = self.value_head(x)
         return value
 
+
 class PPOAgent:
     def __init__(self, config: PPOConfig):
         self.config = config
-        self.device = config.device
-        self.observation_space = config.observation_space
-        self.action_space = config.action_space
-        self.batch_size = config.batch_size
-        self.gamma = config.gamma
-        self.eps_clip = config.eps_clip
-        self.k_epochs = config.k_epochs
-        self.lam = config.lam
-        self.entropy_factor = config.entropy_factor
+        self.device = config.DEVICE
+        self.observation_space = config.OBSERVATION_SPACE
+        self.action_space = config.ACTION_SPACE
+        self.batch_size = config.BATCH_SIZE
+        self.gamma = config.GAMMA
+        self.eps_clip = config.EPS_CLIP
+        self.k_epochs = config.K_EPOCHS
+        self.lam = config.LAM
+        self.entropy_factor = config.ENTROPY_FACTOR
 
         self.actor = Actor(self.observation_space, self.action_space).to(self.device)
         self.critic = Critic(self.observation_space).to(self.device)
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.actor_lr)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.critic_lr)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.ACTOR_LR)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.CRITIC_LR)
 
         self.memory: Dict[str, List[Any]] = {
             'states': [],
@@ -208,37 +202,36 @@ class PPOAgent:
         self.obs_var = np.ones(self.observation_space, dtype=np.float32)
         self.obs_count = 1.0
 
-    def preprocess_obs(self, obs: Any) -> np.ndarray:
+    def preprocess_obs(self, obs: Any):
         try:
-            # Handle different observation formats
             if len(obs) == 2:
                 obs = obs[0]
             if isinstance(obs, tuple) and len(obs) == 4:
                 concatenated = np.concatenate([np.asarray(part).flatten() for part in obs])
                 padded = np.pad(
                     concatenated,
-                    (0, max(0, self.config.observation_space - len(concatenated))),
+                    (0, max(0, self.config.OBSERVATION_SPACE - len(concatenated))),
                     'constant'
-                )[:self.config.observation_space]
+                )[:self.config.OBSERVATION_SPACE]
                 return padded.astype(np.float32)
             else:
                 logger.warning("Unexpected observation format. Setting to zeros.")
-                return np.zeros(self.config.observation_space, dtype=np.float32)
+                return np.zeros(self.config.OBSERVATION_SPACE, dtype=np.float32)
         except Exception as e:
             logger.error(f"Error in preprocess_obs: {e}")
-            return np.zeros(self.config.observation_space, dtype=np.float32)
+            return np.zeros(self.config.OBSERVATION_SPACE, dtype=np.float32)
 
-    def update_obs_stats(self, obs: np.ndarray):
+    def update_obs_stats(self, obs):
         self.obs_count += 1
         delta = obs - self.obs_mean
         self.obs_mean += delta / self.obs_count
         delta2 = obs - self.obs_mean
         self.obs_var += delta * delta2
 
-    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+    def normalize_obs(self, obs):
         return (obs - self.obs_mean) / (np.sqrt(self.obs_var / self.obs_count) + 1e-8)
 
-    def select_action(self, state: Any) -> (np.ndarray, float):
+    def select_action(self, state):
         obs = self.preprocess_obs(state)
         self.update_obs_stats(obs)
         norm_obs = self.normalize_obs(obs)
@@ -253,7 +246,7 @@ class PPOAgent:
 
         return action_tanh.cpu().numpy()[0], log_prob
 
-    def store_transition(self, state: Any, action: np.ndarray, log_prob: float, reward: float, done: bool):
+    def store_transition(self, state, action, log_prob, reward, done):
         obs = self.preprocess_obs(state)
         self.update_obs_stats(obs)
         norm_obs = self.normalize_obs(obs)
@@ -270,7 +263,7 @@ class PPOAgent:
 
         logger.debug(f"Stored Transition | Reward: {reward} | Done: {done}")
 
-    def compute_returns_and_advantages(self, rewards: List[float], dones: List[bool], values: List[float], next_value: float) -> (List[float], List[float]):
+    def compute_returns_and_advantages(self, rewards, dones, values, next_value):
         returns, advantages = [], []
         gae = 0.0
         for step in reversed(range(len(rewards))):
@@ -296,7 +289,6 @@ class PPOAgent:
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states).to(self.device)
             values = self.critic(states_tensor).squeeze().cpu().numpy()
-            # Get value of the last state
             last_state = self.memory['states'][-1]
             last_state_tensor = torch.FloatTensor(last_state).unsqueeze(0).to(self.device)
             next_value = self.critic(last_state_tensor).cpu().item()
@@ -305,7 +297,7 @@ class PPOAgent:
         returns, advantages = self.compute_returns_and_advantages(rewards, dones, values, next_value)
 
         advantages = np.array(advantages, dtype=np.float32)
-        if self.config.norm_advantages:
+        if self.config.NORM_ADVANTAGES:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         returns = torch.FloatTensor(returns).to(self.device)
@@ -341,19 +333,18 @@ class PPOAgent:
 
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.grad_clip_val)
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.GRAD_CLIP_VAL)
                 self.actor_optimizer.step()
 
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.grad_clip_val)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.GRAD_CLIP_VAL)
                 self.critic_optimizer.step()
 
                 actor_losses.append(actor_loss.item())
                 critic_losses.append(critic_loss.item())
-                total_losses.append((actor_loss + self.config.critic_coef * critic_loss).item())
+                total_losses.append((actor_loss + self.config.CRITIC_COEF * critic_loss).item())
 
-        # Reset memory after update
         self.reset_memory()
 
         avg_actor_loss = np.mean(actor_losses)
@@ -372,86 +363,170 @@ class PPOAgent:
             'values': []
         }
 
-    def save(self, path: str):
-        """Save model checkpoints."""
-        torch.save({
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_optimizer': self.critic_optimizer.state_dict(),
-        }, path)
-        logger.info(f"Model saved to {path}")
+    def save(self, path="agents/ppo/saved_agent.pth"):
+        """Saves the PPO agent (actor, critics, and optimizers)."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)  # Ensure the directory exists
+            torch.save({
+                'actor_state_dict': self.actor.state_dict(),
+                'critic_state_dict': self.critic.state_dict(),
+                'actor_optimizer': self.actor_optimizer.state_dict(),
+                'critic_optimizer': self.critic_optimizer.state_dict(),
+            }, path)
+            logger.info(f"PPO agent saved to {path}")
+        except Exception as e:
+            logger.error(f"Failed to save PPO agent to {path}: {e}")
 
-    def load(self, path: str):
-        """Load model checkpoints."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
-        logger.info(f"Model loaded from {path}")
+    def load(self, path="agents/ppo/saved_agent.pth"):
+        """Loads the PPO agent (actor, critics, and optimizers)."""
+        try:
+            checkpoint = torch.load(path, map_location=self.device)
+            self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+            self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+            logger.info(f"PPO agent loaded from {path}")
+        except FileNotFoundError:
+            logger.warning(f"No saved agent found at {path}. Starting with random weights.")
+        except Exception as e:
+            logger.error(f"Failed to load PPO agent from {path}: {e}")
+
 
 class PPOTrainer:
     def __init__(self, config: PPOConfig):
         self.config = config
-        self.device = config.device
+        self.device = config.DEVICE
 
-        # Create directories for models and logs
-        os.makedirs(self.config.model_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.config.log_dir, 'plots'), exist_ok=True)
-
-        # Initialize environment and agent
         self.env = get_environment()
         self.agent = PPOAgent(config)
 
-        # Initialize metrics
+        # Initialize lists
         self.total_rewards: List[float] = []
         self.best_reward: float = -float('inf')
 
         self.episode_numbers: List[int] = []
         self.avg_rewards: List[float] = []
 
-        # New metrics for lap times and steps
         self.lap_times: List[float] = []
         self.steps_record: List[int] = []
-        self.cumulative_steps: int = 0  # Total steps across episodes
+        self.cumulative_steps: int = 0
 
-    def plot_and_save_graphs(self, steps: int, cumulative_rewards: List[float], lap_times: List[float], steps_record: List[int], filename_prefix: str = "graphsPPO/performance"):
-        plt.figure(figsize=(12, 6))
+        try:
+            # Assign loaded data to the correct variables
+            loaded_rewards, loaded_lap_times, loaded_steps_record, self.last_step = self.load_graph_data()
+            self.total_rewards = loaded_rewards
+            self.lap_times = loaded_lap_times
+            self.steps_record = loaded_steps_record
+            self.cumulative_steps = self.last_step
 
-        # Subplot 1: Cumulative Reward vs Steps
-        plt.subplot(1, 2, 1)
-        plt.plot(steps_record, cumulative_rewards, label="Cumulative Reward", color='blue')
-        plt.xlabel("Steps")
-        plt.ylabel("Cumulative Reward")
-        plt.title("Cumulative Reward vs Steps")
-        plt.legend()
-        plt.grid(True)
+            # Truncate lists to the minimum length to ensure consistency
+            min_length = min(len(self.total_rewards), len(self.lap_times), len(self.steps_record))
+            if not (len(self.total_rewards) == len(self.lap_times) == len(self.steps_record)):
+                logger.warning(
+                    f"Truncating lists to minimum length {min_length} to ensure consistency."
+                )
+                self.total_rewards = self.total_rewards[:min_length]
+                self.lap_times = self.lap_times[:min_length]
+                self.steps_record = self.steps_record[:min_length]
 
-        # Subplot 2: Lap Time vs Steps
-        plt.subplot(1, 2, 2)
-        plt.plot(steps_record, lap_times, label="Lap Time", color='orange')
-        plt.xlabel("Steps")
-        plt.ylabel("Lap Time (s)")
-        plt.title("Lap Time vs Steps")
-        plt.legend()
-        plt.grid(True)
+            self.agent.load()
+            logger.info("Successfully loaded graph data and agent.")
+        except FileNotFoundError:
+            logger.info("No saved agent or graph data found, starting fresh.")
+        except Exception as e:
+            logger.error(f"Error loading saved agent or graph data: {e}")
+            logger.info("Starting with a fresh agent and graph data.")
 
-        # Save the plots
-        plt.tight_layout()
-        plt.savefig(f"{filename_prefix}_step_{steps}.png")
-        plt.close()
-        logger.info(f"Saved training metrics plot to {filename_prefix}_step_{steps}.png")
+    def plot_and_save_graphs(self, steps, cumulative_rewards, lap_times, steps_record,
+                             filename_prefix="graphs/ppo/performance"):
+        try:
+            os.makedirs(os.path.dirname(filename_prefix), exist_ok=True)  # Ensure the directory exists
+
+            # Validate that all lists have the same length
+            if not (len(steps_record) == len(cumulative_rewards) == len(lap_times)):
+                logger.error(
+                    f"Data length mismatch: steps_record({len(steps_record)}), "
+                    f"cumulative_rewards({len(cumulative_rewards)}), "
+                    f"lap_times({len(lap_times)})"
+                )
+                return
+
+            plt.figure(figsize=(12, 6))
+
+            plt.subplot(1, 2, 1)
+            plt.plot(steps_record, cumulative_rewards, label="Cumulative Reward")
+            plt.xlabel("Steps")
+            plt.ylabel("Cumulative Reward")
+            plt.title("Cumulative Reward vs Steps")
+            plt.legend()
+
+            plt.subplot(1, 2, 2)
+            plt.plot(steps_record, lap_times, label="Lap Time")
+            plt.xlabel("Steps")
+            plt.ylabel("Lap Time (s)")
+            plt.title("Lap Time vs Steps")
+            plt.legend()
+
+            plt.tight_layout()
+            save_path = f"{filename_prefix}_step_{steps}.png"
+            plt.savefig(save_path)
+            plt.close()
+            logger.info(f"Saved training metrics plot to {save_path}")
+        except Exception as e:
+            logger.error(f"Failed to plot and save graphs: {e}", exc_info=True)
+
+    def save_graph_data(self, cumulative_rewards, lap_times, steps_record, last_step,
+                        filename="graphs/ppo/graph_data.pkl"):
+        """Saves graph data to a file."""
+        try:
+            # Ensure all lists have the same length before saving
+            min_length = min(len(cumulative_rewards), len(lap_times), len(steps_record))
+            if not (len(cumulative_rewards) == len(lap_times) == len(steps_record)):
+                logger.warning(
+                    f"Truncating lists to minimum length {min_length} before saving."
+                )
+                cumulative_rewards = cumulative_rewards[:min_length]
+                lap_times = lap_times[:min_length]
+                steps_record = steps_record[:min_length]
+
+            os.makedirs(os.path.dirname(filename), exist_ok=True)  # Ensure the directory exists
+
+            with open(filename, 'wb') as f:
+                pickle.dump({
+                    'cumulative_rewards': cumulative_rewards,
+                    'lap_times': lap_times,
+                    'steps_record': steps_record,
+                    'last_step': last_step
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"Graph data saved to {filename}.")
+        except OSError as e:
+            logger.error(f"Failed to save graph data: {e}")
+
+    def load_graph_data(self, filename="graphs/ppo/graph_data.pkl"):
+        """Loads graph data from a file."""
+        try:
+            with open(filename, 'rb') as f:
+                data = pickle.load(f)
+            logger.info(f"Graph data loaded from {filename}.")
+            return (
+                data.get('cumulative_rewards', []),
+                data.get('lap_times', []),
+                data.get('steps_record', []),
+                data.get('last_step', 0)
+            )
+        except FileNotFoundError:
+            logger.warning(f"No graph data found at {filename}, starting fresh.")
+            return [], [], [], 0
 
     def run(self):
         logger.info("Starting PPO training...")
-        for episode in range(1, self.config.num_episodes + 1):
+        for episode in range(1, self.config.NUM_EPISODES + 1):
             state = self.env.reset()
             episode_reward = 0
             episode_steps = 0
-            lap_time = 0.0  # Initialize lap_time for the episode
+            lap_time = 0
 
-            for step in range(self.config.max_steps):
+            for step in range(self.config.MAX_STEPS):
                 action, log_prob = self.agent.select_action(state)
 
                 clamped_action = np.clip(action, -1, 1)
@@ -459,14 +534,11 @@ class PPOTrainer:
                 next_state, reward, terminated, truncated, info = self.env.step(clamped_action)
                 done = terminated or truncated
 
-                # Extract lap_time from info if available
                 if 'lap_time' in info:
                     lap_time = info['lap_time']
                 else:
-                    # Handle cases where lap_time is not provided
                     lap_time = 0.0
 
-                # Store transition
                 self.agent.store_transition(state, action, log_prob, reward, done)
                 state = next_state
                 episode_reward += reward
@@ -476,70 +548,44 @@ class PPOTrainer:
                 if done:
                     break
 
-            # Update policy if enough transitions are collected
-            if len(self.agent.memory['states']) >= self.config.memory_size:
+            if len(self.agent.memory['states']) >= self.config.MEMORY_SIZE:
                 logger.info(f"Updating policy at episode {episode}")
                 self.agent.update()
 
-            # Logging rewards
             self.total_rewards.append(episode_reward)
             avg_reward = np.mean(self.total_rewards[-100:])
 
-            # Append to episode_numbers and avg_rewards
             self.episode_numbers.append(episode)
             self.avg_rewards.append(avg_reward)
 
-            # Append new metrics
             self.lap_times.append(lap_time)
             self.steps_record.append(self.cumulative_steps)
 
             logger.info(
-                f"Episode {episode}/{self.config.num_episodes} | "
+                f"Episode {episode}/{self.config.NUM_EPISODES} | "
                 f"Reward: {episode_reward:.2f} | "
                 f"Average Reward (last 100): {avg_reward:.2f} | "
                 f"Lap Time: {lap_time:.2f} | Steps: {episode_steps}"
             )
 
-            # Plot and save rewards at intervals
-            if episode % self.config.log_interval == 0:
-                self.plot_and_save_graphs(
-                    steps=episode,
-                    cumulative_rewards=self.total_rewards.copy(),
-                    lap_times=self.lap_times.copy(),
-                    steps_record=self.steps_record.copy(),
-                    filename_prefix=os.path.join(self.config.log_dir, 'plots', 'training_metrics')
-                )
-
-                # Save best model if average reward improves
-                if avg_reward > self.best_reward:
-                    self.best_reward = avg_reward
-                    best_model_path = os.path.join(self.config.model_dir, 'best_model.pth')
-                    self.agent.save(best_model_path)
-                    logger.info(f"New best model saved to {best_model_path}")
-
-            # Save model checkpoints at intervals
-            if episode % self.config.save_interval == 0:
-                model_path = os.path.join(self.config.model_dir, f"ppo_episode_{episode}.pt")
-                self.agent.save(model_path)
-                logger.info(f"Model checkpoint saved to {model_path}")
-
-        # Final plotting if not captured by log_interval
-        if self.config.num_episodes % self.config.log_interval != 0:
-            last_avg_reward = np.mean(self.total_rewards[-100:])
-            self.episode_numbers.append(self.config.num_episodes)
-            self.avg_rewards.append(last_avg_reward)
-            self.lap_times.append(lap_time)
-            self.steps_record.append(self.cumulative_steps)
-            self.plot_and_save_graphs(
-                steps=self.config.num_episodes,
-                cumulative_rewards=self.total_rewards.copy(),
-                lap_times=self.lap_times.copy(),
-                steps_record=self.steps_record.copy(),
-                filename_prefix=os.path.join(self.config.log_dir, 'plots', 'training_metrics')
+            logger.debug(
+                f"After Episode {episode}: "
+                f"total_rewards({len(self.total_rewards)}), "
+                f"lap_times({len(self.lap_times)}), "
+                f"steps_record({len(self.steps_record)})"
             )
+
+            if episode % self.config.SAVE_INTERVAL == 0 and episode_steps != 0:
+                self.agent.save()
+                self.save_graph_data(self.total_rewards.copy(), self.lap_times.copy(), self.steps_record.copy(),
+                                     self.cumulative_steps)
+                steps = self.cumulative_steps
+                self.plot_and_save_graphs(steps, self.total_rewards.copy(), self.lap_times.copy(),
+                                          self.steps_record.copy())
 
         self.env.close()
         logger.info("PPO training completed.")
+
 
 def train_ppo():
     config = PPOConfig()

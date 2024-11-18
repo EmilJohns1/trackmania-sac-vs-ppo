@@ -81,12 +81,12 @@
       "act_buf_len": 2,
       "benchmark": false,
       "wait_on_done": true,
-      "ep_max_length": 10000,
+      "ep_max_length": 2500,
 	  "interface_kwargs": {"save_replays": false}
     },
 	"REWARD_CONFIG": {
 		"END_OF_TRACK": 100.0,
-		"CONSTANT_PENALTY": -0.10,
+		"CONSTANT_PENALTY": 0,
 		"CHECK_FORWARD": 500,
 		"CHECK_BACKWARD": 10,
 		"FAILURE_COUNTDOWN": 10,
