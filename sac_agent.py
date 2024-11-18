@@ -18,20 +18,22 @@ from tmrl import get_environment
 class SACConfig:
     DEVICE: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     MAX_STEPS: int = 10000000
-    STEP_DELAY: float = 0.01
     OBSERVATION_SPACE: int = 85
     ACTION_SPACE: int = 3
-    ALPHA: float = 0.1
+    ALPHA: float = 0.01
     BUFFER_SIZE: int = int(5e5)
     BATCH_SIZE: int = 256
-    GAMMA: float = 0.99
+    GAMMA: float = 0.995
     TAU: float = 0.005
-    LEARNING_RATE: float = float(3e-4)
+    LEARNING_RATE_ACTOR: float = float(1e-5)
+    LEARNING_RATE_CRITIC: float = float(5e-5)
+    LEARNING_RATE_ENTROPY: float = float(3e-4)
     SAVE_INTERVAL: int = 10000
 
 def calculate_centerline_distance(obs):
     lidar = np.asarray(obs[1]).reshape(-1)
     return lidar[0] - lidar[18]
+
 
 class Actor(nn.Module):
     def __init__(self, obs_dim, act_dim):
@@ -41,7 +43,6 @@ class Actor(nn.Module):
         self.mu = nn.Linear(256, act_dim)
         self.log_std = nn.Linear(256, act_dim)
 
-        # Weight initialization
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -84,7 +85,9 @@ class SACAgent:
         self.obs_dim = config.OBSERVATION_SPACE
         self.act_dim = config.ACTION_SPACE
         self.alpha = config.ALPHA
-        self.learning_rate = config.LEARNING_RATE
+        self.learning_rate_actor = config.LEARNING_RATE_ACTOR
+        self.learning_rate_critic = config.LEARNING_RATE_CRITIC
+        self.learning_rate_entropy = config.LEARNING_RATE_ENTROPY
 
         self.actor = Actor(self.obs_dim, self.act_dim).to(self.device)
         self.critic1 = Critic(self.obs_dim, self.act_dim).to(self.device)
@@ -92,14 +95,14 @@ class SACAgent:
         self.target_critic1 = Critic(self.obs_dim, self.act_dim).to(self.device)
         self.target_critic2 = Critic(self.obs_dim, self.act_dim).to(self.device)
 
-        self.target_entropy = -self.act_dim * 0.33
+        self.target_entropy = -0.5
         self.log_alpha = torch.tensor(np.log(self.alpha), requires_grad=True, device=self.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=self.learning_rate)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=self.learning_rate_entropy)
         self.alpha = self.log_alpha.exp()
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.learning_rate)
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=self.learning_rate)
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=self.learning_rate)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.learning_rate_actor)
+        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=self.learning_rate_critic)
+        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=self.learning_rate_critic)
 
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
@@ -295,7 +298,7 @@ class SACAgent:
 
         return torch.tensor(normalized_obs, dtype=torch.float32).to(self.device)
 
-    def save(self, file_path="agents/sac/saved_agent.pth"):
+    def save(self, path="agents/sac/saved_agent.pth"):
         """Saves the SAC agent (actor, critics, and optimizers)."""
         torch.save({
             'actor': self.actor.state_dict(),
@@ -309,12 +312,17 @@ class SACAgent:
             'alpha': self.alpha.item(),
             'log_alpha': self.log_alpha.item(),
             'alpha_optimizer': self.alpha_optimizer.state_dict(),
-        }, file_path)
-        print(f"SAC agent saved to {file_path}")
+            'obs_mean': self.obs_mean,
+            'obs_var': self.obs_var,
+            'obs_count': self.obs_count,
+            'fisher_matrix': self.fisher_matrix,
+            'prev_params': self.prev_params
+        }, path)
+        print(f"SAC agent saved to {path}")
 
-    def load(self, file_path="agents/sac/saved_agent.pth"):
+    def load(self, path="agents/sac/saved_agent.pth"):
         """Loads the SAC agent (actor, critics, and optimizers)."""
-        checkpoint = torch.load(file_path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic1.load_state_dict(checkpoint['critic1'])
         self.critic2.load_state_dict(checkpoint['critic2'])
@@ -326,7 +334,12 @@ class SACAgent:
         self.alpha = torch.tensor(checkpoint['alpha'], device=self.device)
         self.log_alpha = torch.tensor(np.log(checkpoint['alpha']), device=self.device, requires_grad=True)
         self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
-        print(f"SAC agent loaded from {file_path}")
+        self.obs_mean = checkpoint.get('obs_mean', self.obs_mean)
+        self.obs_var = checkpoint.get('obs_var', self.obs_var)
+        self.obs_count = checkpoint.get('obs_count', self.obs_count)
+        self.fisher_matrix = checkpoint.get('fisher_matrix', {})
+        self.prev_params = checkpoint.get('prev_params', {})
+        print(f"SAC agent loaded from {path}")
 
 class ReplayBuffer:
     def __init__(self, config: SACConfig):
@@ -353,31 +366,29 @@ class ReplayBuffer:
     def size(self):
         return len(self.buffer)
 
-    def save(self, file_path="agents/sac/replay_buffer.pkl"):
+    def save(self, path="agents/sac/replay_buffer.pkl"):
         """Saves the replay buffer to a file."""
-        with open(file_path, 'wb') as f:
+        with open(path, 'wb') as f:
             pickle.dump(self.buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"Replay buffer saved to {file_path}")
+        print(f"Replay buffer saved to {path}")
 
-    def load(self, file_path="agents/sac/replay_buffer.pkl"):
+    def load(self, path="agents/sac/replay_buffer.pkl"):
         """Loads the replay buffer from a file."""
-        with open(file_path, 'rb') as f:
+        with open(path, 'rb') as f:
             self.buffer = pickle.load(f)
-        print(f"Replay buffer loaded from {file_path}")
+        print(f"Replay buffer loaded from {path}")
 
 
 class SACTrainer:
     def __init__(self, config: SACConfig):
         self.device = config.DEVICE
         self.max_steps = config.MAX_STEPS
-        self.step_delay = config.STEP_DELAY
         self.batch_size = config.BATCH_SIZE
         self.save_interval = config.SAVE_INTERVAL
 
         self.env = get_environment()
         self.agent = SACAgent(config)
         self.replay_buffer = ReplayBuffer(config)
-        self.last_step = 0
 
         try:
             self.replay_buffer.load()
@@ -389,11 +400,13 @@ class SACTrainer:
     def apply_penalties(self, obs, action):
         speed = obs[0]
 
-        if speed < 3 and abs(action[1]) > 0 and abs(action[2]) < 0.6:
-            action[1] = 0
+        if speed < 17.5 and action[1] > 0:
+            action[1] = -1
 
-        if speed < 15 and action[0] < 0.9 and abs(action[2]) < 0.6:
+        if speed < 22.5 and action[0] < 0.9:
             action[0] = 1.0
+
+        return action
 
     def plot_and_save_graphs(self, steps, cumulative_rewards, lap_times, steps_record, filename_prefix="graphs/sac/performance"):
         plt.figure(figsize=(12, 6))
@@ -461,15 +474,13 @@ class SACTrainer:
         obs, info = self.env.reset()
 
         for step in range(self.max_steps):
-            time.sleep(self.step_delay)
-
             processed_obs = self.agent.preprocess_obs(obs)
             act, log_prob = self.agent.sample_action(
                 torch.tensor(processed_obs, dtype=torch.float32).unsqueeze(0).to(self.device)
             )
             action = act.cpu().detach().numpy().flatten()
 
-            self.apply_penalties(obs, action)
+            action = self.apply_penalties(obs, action)
 
             obs_next, reward, terminated, truncated, info = self.env.step(action)
             cumulative_reward += reward
@@ -507,6 +518,8 @@ class SACTrainer:
                 self.save_graph_data(cumulative_rewards, lap_times, steps_record, step)
                 steps = self.last_step + step
                 self.plot_and_save_graphs(steps, cumulative_rewards, lap_times, steps_record)
+
+                time.sleep(5)
 
 def train_sac():
     config = SACConfig()
