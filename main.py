@@ -1,6 +1,6 @@
 import argparse
 
-from old.old_ppo_agent import train_ppo
+from ppo_agent import train_ppo
 from sac_agent import train_sac
 
 def main(args):
