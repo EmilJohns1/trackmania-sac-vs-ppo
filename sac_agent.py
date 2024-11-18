@@ -1,3 +1,5 @@
+import os
+import pickle
 import random
 import time
 from collections import deque
@@ -8,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from matplotlib import pyplot as plt
 from tmrl import get_environment
 
 
@@ -21,8 +24,10 @@ class SACConfig:
     ALPHA: float = 0.1
     BUFFER_SIZE: int = int(5e5)
     BATCH_SIZE: int = 256
-    GAMMA: int = 0.995
-    TAU: int = 0.005
+    GAMMA: float = 0.99
+    TAU: float = 0.005
+    LEARNING_RATE: float = float(3e-4)
+    SAVE_INTERVAL: int = 10000
 
 def calculate_centerline_distance(obs):
     lidar = np.asarray(obs[1]).reshape(-1)
@@ -79,6 +84,7 @@ class SACAgent:
         self.obs_dim = config.OBSERVATION_SPACE
         self.act_dim = config.ACTION_SPACE
         self.alpha = config.ALPHA
+        self.learning_rate = config.LEARNING_RATE
 
         self.actor = Actor(self.obs_dim, self.act_dim).to(self.device)
         self.critic1 = Critic(self.obs_dim, self.act_dim).to(self.device)
@@ -86,14 +92,14 @@ class SACAgent:
         self.target_critic1 = Critic(self.obs_dim, self.act_dim).to(self.device)
         self.target_critic2 = Critic(self.obs_dim, self.act_dim).to(self.device)
 
-        self.target_entropy = -self.act_dim * 0.5
+        self.target_entropy = -self.act_dim * 0.33
         self.log_alpha = torch.tensor(np.log(self.alpha), requires_grad=True, device=self.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=self.learning_rate)
         self.alpha = self.log_alpha.exp()
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=3e-4)
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=3e-4)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.learning_rate)
+        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=self.learning_rate)
+        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=self.learning_rate)
 
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
@@ -119,7 +125,7 @@ class SACAgent:
         return action, log_prob.sum(1, keepdim=True)
 
     def update_parameters(self, replay_buffer):
-        obs, action, reward, next_obs, done = replay_buffer.sample()
+        obs, action, reward, next_obs, done = replay_buffer.sample(replay_buffer.batch_size)
         gamma = self.config.GAMMA
         tau = self.config.TAU
 
@@ -289,6 +295,38 @@ class SACAgent:
 
         return torch.tensor(normalized_obs, dtype=torch.float32).to(self.device)
 
+    def save(self, file_path="agents/sac/saved_agent.pth"):
+        """Saves the SAC agent (actor, critics, and optimizers)."""
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic1': self.critic1.state_dict(),
+            'critic2': self.critic2.state_dict(),
+            'target_critic1': self.target_critic1.state_dict(),
+            'target_critic2': self.target_critic2.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic1_optimizer': self.critic1_optimizer.state_dict(),
+            'critic2_optimizer': self.critic2_optimizer.state_dict(),
+            'alpha': self.alpha.item(),
+            'log_alpha': self.log_alpha.item(),
+            'alpha_optimizer': self.alpha_optimizer.state_dict(),
+        }, file_path)
+        print(f"SAC agent saved to {file_path}")
+
+    def load(self, file_path="agents/sac/saved_agent.pth"):
+        """Loads the SAC agent (actor, critics, and optimizers)."""
+        checkpoint = torch.load(file_path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic1.load_state_dict(checkpoint['critic1'])
+        self.critic2.load_state_dict(checkpoint['critic2'])
+        self.target_critic1.load_state_dict(checkpoint['target_critic1'])
+        self.target_critic2.load_state_dict(checkpoint['target_critic2'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic1_optimizer.load_state_dict(checkpoint['critic1_optimizer'])
+        self.critic2_optimizer.load_state_dict(checkpoint['critic2_optimizer'])
+        self.alpha = torch.tensor(checkpoint['alpha'], device=self.device)
+        self.log_alpha = torch.tensor(np.log(checkpoint['alpha']), device=self.device, requires_grad=True)
+        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
+        print(f"SAC agent loaded from {file_path}")
 
 class ReplayBuffer:
     def __init__(self, config: SACConfig):
@@ -299,8 +337,10 @@ class ReplayBuffer:
     def store(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
 
-    def sample(self):
-        batch = random.sample(self.buffer, self.batch_size)
+    def sample(self, batch_size):
+        if self.batch_size < batch_size:
+            batch_size = self.batch_size
+        batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = map(np.array, zip(*batch))
         return (
             torch.tensor(states, dtype=torch.float32).to(self.device),
@@ -313,6 +353,18 @@ class ReplayBuffer:
     def size(self):
         return len(self.buffer)
 
+    def save(self, file_path="agents/sac/replay_buffer.pkl"):
+        """Saves the replay buffer to a file."""
+        with open(file_path, 'wb') as f:
+            pickle.dump(self.buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Replay buffer saved to {file_path}")
+
+    def load(self, file_path="agents/sac/replay_buffer.pkl"):
+        """Loads the replay buffer from a file."""
+        with open(file_path, 'rb') as f:
+            self.buffer = pickle.load(f)
+        print(f"Replay buffer loaded from {file_path}")
+
 
 class SACTrainer:
     def __init__(self, config: SACConfig):
@@ -320,20 +372,82 @@ class SACTrainer:
         self.max_steps = config.MAX_STEPS
         self.step_delay = config.STEP_DELAY
         self.batch_size = config.BATCH_SIZE
+        self.save_interval = config.SAVE_INTERVAL
 
         self.env = get_environment()
-        self.config = SACConfig()
         self.agent = SACAgent(config)
         self.replay_buffer = ReplayBuffer(config)
+        self.last_step = 0
+
+        try:
+            self.replay_buffer.load()
+            self.cumulative_rewards, self.fastest_lap_times, self.steps_record, self.last_step = self.load_graph_data()
+            self.agent.load()
+        except FileNotFoundError:
+            print("No saved agent or replay buffer found, starting fresh.")
 
     def apply_penalties(self, obs, action):
         speed = obs[0]
 
-        if speed < 10 and abs(action[1]) > 0 and abs(action[2]) < 0.6:
+        if speed < 3 and abs(action[1]) > 0 and abs(action[2]) < 0.6:
             action[1] = 0
 
-        if speed < 10 and action[0] < 0.9 and abs(action[2]) < 0.6:
+        if speed < 15 and action[0] < 0.9 and abs(action[2]) < 0.6:
             action[0] = 1.0
+
+    def plot_and_save_graphs(self, steps, cumulative_rewards, lap_times, steps_record, filename_prefix="graphs/sac/performance"):
+        plt.figure(figsize=(12, 6))
+
+        plt.subplot(1, 2, 1)
+        plt.plot(steps_record, cumulative_rewards, label="Cumulative Reward")
+        plt.xlabel("Steps")
+        plt.ylabel("Cumulative Reward")
+        plt.title("Cumulative Reward vs Steps")
+        plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(steps_record, lap_times, label="Lap Time")
+        plt.xlabel("Steps")
+        plt.ylabel("Lap Time (s)")
+        plt.title("Lap Time vs Steps")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(f"{filename_prefix}_step_{steps}.png")
+        plt.close()
+        print(f"Saved graphs at step {steps}.")
+
+    def save_graph_data(self, cumulative_rewards, lap_times, steps_record, last_step, filename="graphs/sac/graph_data.pkl"):
+        """Saves graph data to a file."""
+        try:
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+            with open(filename, 'wb') as f:
+                pickle.dump({
+                    'cumulative_rewards': cumulative_rewards,
+                    'lap_times': lap_times,
+                    'steps_record': steps_record,
+                    'last_step': last_step
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"Graph data saved to {filename}.")
+        except OSError as e:
+            print(f"Failed to save graph data: {e}")
+
+    def load_graph_data(self, filename="graphs/sac/graph_data.pkl"):
+        """Loads graph data from a file."""
+        try:
+            with open(filename, 'rb') as f:
+                data = pickle.load(f)
+            print(f"Graph data loaded from {filename}.")
+            return (
+                data['cumulative_rewards'],
+                data['lap_times'],
+                data['steps_record'],
+                data.get('last_step', 0)
+            )
+        except FileNotFoundError:
+            print(f"No graph data found at {filename}, starting fresh.")
+            return [], [], [], 0
 
     def run(self):
         cumulative_reward = 0
@@ -387,10 +501,12 @@ class SACTrainer:
             if self.replay_buffer.size() >= self.batch_size:
                 self.agent.update_parameters(self.replay_buffer)
 
-            if step % 10000 == 0 and step != 0:
-                # Save agent and replay buffer periodically
-                pass
-
+            if step % self.save_interval == 0 and step != 0:
+                self.agent.save()
+                self.replay_buffer.save()
+                self.save_graph_data(cumulative_rewards, lap_times, steps_record, step)
+                steps = self.last_step + step
+                self.plot_and_save_graphs(steps, cumulative_rewards, lap_times, steps_record)
 
 def train_sac():
     config = SACConfig()
