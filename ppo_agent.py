@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -8,12 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tmrl import get_environment
 from torch.distributions import Normal
 from torch.utils.data import DataLoader, TensorDataset
-from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
-
-from tmrl import get_environment  # Ensure this function is correctly defined in the tmrl module
 
 # Configure logging
 logging.basicConfig(
@@ -23,17 +22,16 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("PPO_AGENT")
 
-# Configuration using dataclass
 @dataclass
 class PPOConfig:
     device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    state_dim: int = 85
+    state_dim: int = 83
     action_dim: int = 3
     batch_size: int = 100
-    actor_lr: float = 0.001
-    critic_lr: float = 0.0005
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
     gamma: float = 0.99
     eps_clip: float = 0.2
     k_epochs: int = 10
@@ -46,23 +44,56 @@ class PPOConfig:
     save_interval: int = 100
     model_dir: str = "agentsPPO"
     log_dir: str = "graphsPPO"
+    avg_ray: float = 400
+    critic_coef: float = 0.5
+    grad_clip_val: float = 0.1
+    norm_advantages: bool = True
 
-# Actor Network
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
         super(Actor, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU()
+        # Define dimensions
+        lidar_dim = 72
+        other_dim = state_dim - lidar_dim
+
+        # Lidar Subnetwork
+        self.lidar_net = nn.Sequential(
+            nn.Linear(lidar_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01)
         )
-        self.mean = nn.Linear(256, action_dim)
-        self.log_std = nn.Linear(256, action_dim)
+
+        # Other Sensors Subnetwork
+        self.other_net = nn.Sequential(
+            nn.Linear(other_dim, hidden_dim // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_dim // 2, hidden_dim // 2),
+            nn.LeakyReLU(negative_slope=0.01)
+        )
+
+        # Combined Network
+        self.combined_net = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01)
+        )
+
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
         self._initialize_weights()
 
     def _initialize_weights(self):
-        for layer in self.network:
+        for layer in self.lidar_net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        for layer in self.other_net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        for layer in self.combined_net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
@@ -72,35 +103,79 @@ class Actor(nn.Module):
         nn.init.zeros_(self.log_std.bias)
 
     def forward(self, state: torch.Tensor):
-        x = self.network(state)
+        lidar_dim = 72
+        lidar = state[:, :lidar_dim]
+        other = state[:, lidar_dim:]
+        lidar_features = self.lidar_net(lidar)
+        other_features = self.other_net(other)
+        combined = torch.cat((lidar_features, other_features), dim=1)
+        x = self.combined_net(combined)
         mean = self.mean(x)
         log_std = self.log_std(x).clamp(-20, 2)
         std = torch.exp(log_std)
         return mean, std
 
-# Critic Network
 class Critic(nn.Module):
-    def __init__(self, state_dim: int):
+    def __init__(self, state_dim: int, hidden_dim: int = 256):
         super(Critic, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
+        # Define dimensions based on your observation structure
+        lidar_dim = 72
+        other_dim = state_dim - lidar_dim
+
+        # Lidar Subnetwork
+        self.lidar_net = nn.Sequential(
+            nn.Linear(lidar_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01)
         )
+
+        # Other Sensors Subnetwork
+        self.other_net = nn.Sequential(
+            nn.Linear(other_dim, hidden_dim // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_dim // 2, hidden_dim // 2),
+            nn.LeakyReLU(negative_slope=0.01)
+        )
+
+        # Combined Network
+        self.combined_net = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.01)
+        )
+
+        self.value_head = nn.Linear(hidden_dim, 1)
         self._initialize_weights()
 
     def _initialize_weights(self):
-        for layer in self.network:
+        for layer in self.lidar_net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
+        for layer in self.other_net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        for layer in self.combined_net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        nn.init.xavier_uniform_(self.value_head.weight)
+        nn.init.zeros_(self.value_head.bias)
 
     def forward(self, state: torch.Tensor):
-        return self.network(state)
+        lidar_dim = 72  # Adjust based on your observation structure
+        lidar = state[:, :lidar_dim]
+        other = state[:, lidar_dim:]
+        lidar_features = self.lidar_net(lidar)
+        other_features = self.other_net(other)
+        combined = torch.cat((lidar_features, other_features), dim=1)
+        x = self.combined_net(combined)
+        value = self.value_head(x)
+        return value
 
-# PPO Agent
 class PPOAgent:
     def __init__(self, config: PPOConfig):
         self.config = config
@@ -134,12 +209,12 @@ class PPOAgent:
         self.obs_count = 1.0
 
     def preprocess_obs(self, obs: Any) -> np.ndarray:
-        """Preprocess environment observations for compatibility."""
         try:
+            # Handle different observation formats
+            if len(obs) == 2:
+                obs = obs[0]
             if isinstance(obs, tuple) and len(obs) == 4:
-                # Flatten and concatenate all parts of the observation
                 concatenated = np.concatenate([np.asarray(part).flatten() for part in obs])
-                # Pad with zeros if necessary
                 padded = np.pad(
                     concatenated,
                     (0, max(0, self.config.state_dim - len(concatenated))),
@@ -147,7 +222,6 @@ class PPOAgent:
                 )[:self.config.state_dim]
                 return padded.astype(np.float32)
             else:
-                # Handle unexpected formats by returning a zero array
                 logger.warning("Unexpected observation format. Setting to zeros.")
                 return np.zeros(self.config.state_dim, dtype=np.float32)
         except Exception as e:
@@ -155,7 +229,6 @@ class PPOAgent:
             return np.zeros(self.config.state_dim, dtype=np.float32)
 
     def update_obs_stats(self, obs: np.ndarray):
-        """Update running statistics for observation normalization."""
         self.obs_count += 1
         delta = obs - self.obs_mean
         self.obs_mean += delta / self.obs_count
@@ -163,11 +236,9 @@ class PPOAgent:
         self.obs_var += delta * delta2
 
     def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
-        """Normalize observations."""
         return (obs - self.obs_mean) / (np.sqrt(self.obs_var / self.obs_count) + 1e-8)
 
-    def select_action(self, state: Any) -> (np.ndarray, np.ndarray):
-        """Select action based on current policy."""
+    def select_action(self, state: Any) -> (np.ndarray, float):
         obs = self.preprocess_obs(state)
         self.update_obs_stats(obs)
         norm_obs = self.normalize_obs(obs)
@@ -177,13 +248,12 @@ class PPOAgent:
             mean, std = self.actor(state_tensor)
         dist = Normal(mean, std)
         action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
-        action_tanh = torch.tanh(action).clamp(-0.999999, 0.999999)  # Prevent exact -1 or 1
+        log_prob = dist.log_prob(action).sum(dim=-1).item()
+        action_tanh = torch.tanh(action).clamp(-0.999999, 0.999999)
 
-        return action_tanh.cpu().numpy()[0], log_prob.cpu().numpy()[0]
+        return action_tanh.cpu().numpy()[0], log_prob
 
-    def store_transition(self, state: Any, action: np.ndarray, log_prob: np.ndarray, reward: float, done: bool):
-        """Store transition in memory."""
+    def store_transition(self, state: Any, action: np.ndarray, log_prob: float, reward: float, done: bool):
         obs = self.preprocess_obs(state)
         self.update_obs_stats(obs)
         norm_obs = self.normalize_obs(obs)
@@ -193,8 +263,14 @@ class PPOAgent:
         self.memory['rewards'].append(reward)
         self.memory['dones'].append(done)
 
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(norm_obs).unsqueeze(0).to(self.device)
+            value = self.critic(state_tensor).cpu().item()
+            self.memory['values'].append(value)
+
+        logger.debug(f"Stored Transition | Reward: {reward} | Done: {done}")
+
     def compute_returns_and_advantages(self, rewards: List[float], dones: List[bool], values: List[float], next_value: float) -> (List[float], List[float]):
-        """Compute returns and Generalized Advantage Estimation (GAE)."""
         returns, advantages = [], []
         gae = 0.0
         for step in reversed(range(len(rewards))):
@@ -211,35 +287,30 @@ class PPOAgent:
             logger.warning("No transitions to update.")
             return
 
-        # Convert memory to NumPy arrays for efficient tensor creation
         states = np.array(self.memory['states'], dtype=np.float32)
         actions = np.array(self.memory['actions'], dtype=np.float32)
         old_log_probs = np.array(self.memory['log_probs'], dtype=np.float32)
         rewards = self.memory['rewards']
         dones = self.memory['dones']
 
-        # Compute value estimates
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states).to(self.device)
             values = self.critic(states_tensor).squeeze().cpu().numpy()
-            # Compute next value
-            next_state = self.memory['states'][-1]
-            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
-            next_value = self.critic(next_state_tensor).item()
+            # Get value of the last state
+            last_state = self.memory['states'][-1]
+            last_state_tensor = torch.FloatTensor(last_state).unsqueeze(0).to(self.device)
+            next_value = self.critic(last_state_tensor).cpu().item()
             values = list(values) + [next_value]
 
-        # Compute returns and advantages
         returns, advantages = self.compute_returns_and_advantages(rewards, dones, values, next_value)
 
-        # Normalize advantages
         advantages = np.array(advantages, dtype=np.float32)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if self.config.norm_advantages:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Convert to tensors
         returns = torch.FloatTensor(returns).to(self.device)
         advantages = torch.FloatTensor(advantages).to(self.device)
 
-        # Create dataset and dataloader
         dataset = TensorDataset(
             torch.FloatTensor(states).to(self.device),
             torch.FloatTensor(actions).to(self.device),
@@ -249,39 +320,49 @@ class PPOAgent:
         )
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        # PPO updates
+        actor_losses = []
+        critic_losses = []
+        total_losses = []
+
         for epoch in range(self.k_epochs):
             for batch in loader:
                 b_states, b_actions, b_old_log_probs, b_returns, b_advantages = batch
 
-                # Forward pass
                 mean, std = self.actor(b_states)
                 dist = Normal(mean, std)
                 log_probs = dist.log_prob(b_actions).sum(dim=-1)
                 entropy = dist.entropy().sum(dim=-1)
 
-                # PPO objective
                 ratios = torch.exp(log_probs - b_old_log_probs.squeeze())
                 surr1 = ratios * b_advantages
                 surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * b_advantages
                 actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_factor * entropy.mean()
                 critic_loss = F.mse_loss(self.critic(b_states).squeeze(), b_returns)
 
-                # Backward pass and optimization
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.grad_clip_val)
                 self.actor_optimizer.step()
 
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.grad_clip_val)
                 self.critic_optimizer.step()
 
-        # Clear memory after update
+                actor_losses.append(actor_loss.item())
+                critic_losses.append(critic_loss.item())
+                total_losses.append((actor_loss + self.config.critic_coef * critic_loss).item())
+
+        # Reset memory after update
         self.reset_memory()
-        logger.debug("Agent updated successfully.")
+
+        avg_actor_loss = np.mean(actor_losses)
+        avg_critic_loss = np.mean(critic_losses)
+        avg_total_loss = np.mean(total_losses)
+
+        logger.info(f"PPO Update | Actor Loss: {avg_actor_loss:.4f} | Critic Loss: {avg_critic_loss:.4f} | Total Loss: {avg_total_loss:.4f}")
 
     def reset_memory(self):
-        """Clear memory buffers."""
         self.memory = {
             'states': [],
             'actions': [],
@@ -310,12 +391,10 @@ class PPOAgent:
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
         logger.info(f"Model loaded from {path}")
 
-# PPO Trainer
 class PPOTrainer:
     def __init__(self, config: PPOConfig):
         self.config = config
         self.device = config.device
-        self.writer = SummaryWriter(log_dir=self.config.log_dir)
 
         os.makedirs(self.config.model_dir, exist_ok=True)
         os.makedirs(self.config.log_dir, exist_ok=True)
@@ -330,7 +409,6 @@ class PPOTrainer:
         self.avg_rewards: List[float] = []
 
     def plot_and_save_rewards(self, episode: int, avg_reward: float):
-        """Plot and save average rewards."""
         self.episode_numbers.append(episode)
         self.avg_rewards.append(avg_reward)
 
@@ -350,19 +428,19 @@ class PPOTrainer:
         logger.info(f"Saved reward plot to {plot_path}")
 
     def run(self):
-        """Run the training loop."""
         logger.info("Starting PPO training...")
         for episode in range(1, self.config.num_episodes + 1):
             state = self.env.reset()
             episode_reward = 0
 
             for step in range(self.config.max_steps):
-                # Select action
                 action, log_prob = self.agent.select_action(state)
-                next_state, reward, terminated, truncated, _ = self.env.step(action)
+
+                clamped_action = np.clip(action, -1, 1)
+
+                next_state, reward, terminated, truncated, _ = self.env.step(clamped_action)
                 done = terminated or truncated
 
-                # Store transition in memory
                 self.agent.store_transition(state, action, log_prob, reward, done)
                 state = next_state
                 episode_reward += reward
@@ -370,53 +448,46 @@ class PPOTrainer:
                 if done:
                     break
 
-            # Update policy if memory size is exceeded
+            # Update policy
             if len(self.agent.memory['states']) >= self.config.memory_size:
                 logger.info(f"Updating policy at episode {episode}")
                 self.agent.update()
 
-            # Track reward
+            # Logging rewards
             self.total_rewards.append(episode_reward)
-            avg_reward = np.mean(self.total_rewards[-100:])  # Last 100 episodes
-            self.writer.add_scalar("Reward/Total", episode_reward, episode)
-            self.writer.add_scalar("Reward/Average (last 100)", avg_reward, episode)
+            avg_reward = np.mean(self.total_rewards[-100:])
 
-            # Per-episode logging
             logger.info(
                 f"Episode {episode}/{self.config.num_episodes} | "
                 f"Reward: {episode_reward:.2f} | "
                 f"Average Reward (last 100): {avg_reward:.2f}"
             )
 
-            # Plot and save rewards at log intervals
+            # Plot and save rewards at intervals
             if episode % self.config.log_interval == 0:
                 self.plot_and_save_rewards(episode, avg_reward)
 
-                # Save the best model
                 if avg_reward > self.best_reward:
                     self.best_reward = avg_reward
                     best_model_path = os.path.join(self.config.model_dir, 'best_model.pth')
                     self.agent.save(best_model_path)
                     logger.info(f"New best model saved to {best_model_path}")
 
-            # Save model checkpoints at save intervals
+            # Save model checkpoints at intervals
             if episode % self.config.save_interval == 0:
                 model_path = os.path.join(self.config.model_dir, f"ppo_episode_{episode}.pt")
                 self.agent.save(model_path)
                 logger.info(f"Model checkpoint saved to {model_path}")
 
-        # Final plotting if needed
+        # Final plotting if not captured by log_interval
         if self.config.num_episodes % self.config.log_interval != 0:
-            last_avg_reward = np.mean(self.total_rewards[-(self.config.num_episodes % self.config.log_interval):])
+            last_avg_reward = np.mean(self.total_rewards[-100:])
             self.plot_and_save_rewards(self.config.num_episodes, last_avg_reward)
 
-        self.writer.close()
         self.env.close()
         logger.info("PPO training completed.")
 
-# Training function
 def train_ppo():
-    """Initialize and run the PPO trainer."""
     config = PPOConfig()
     trainer = PPOTrainer(config)
     trainer.run()
