@@ -396,59 +396,87 @@ class PPOTrainer:
         self.config = config
         self.device = config.device
 
+        # Create directories for models and logs
         os.makedirs(self.config.model_dir, exist_ok=True)
-        os.makedirs(self.config.log_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.config.log_dir, 'plots'), exist_ok=True)
 
+        # Initialize environment and agent
         self.env = get_environment()
         self.agent = PPOAgent(config)
 
+        # Initialize metrics
         self.total_rewards: List[float] = []
         self.best_reward: float = -float('inf')
 
         self.episode_numbers: List[int] = []
         self.avg_rewards: List[float] = []
 
-    def plot_and_save_rewards(self, episode: int, avg_reward: float):
-        self.episode_numbers.append(episode)
-        self.avg_rewards.append(avg_reward)
+        # New metrics for lap times and steps
+        self.lap_times: List[float] = []
+        self.steps_record: List[int] = []
+        self.cumulative_steps: int = 0  # Total steps across episodes
 
-        plt.figure(figsize=(10, 5))
-        plt.plot(self.episode_numbers, self.avg_rewards, label='Average Reward')
-        plt.xlabel('Episode')
-        plt.ylabel('Average Reward')
-        plt.title('Average Reward vs Episode')
+    def plot_and_save_graphs(self, steps: int, cumulative_rewards: List[float], lap_times: List[float], steps_record: List[int], filename_prefix: str = "graphs/sac/performance"):
+        plt.figure(figsize=(12, 6))
+
+        # Subplot 1: Cumulative Reward vs Steps
+        plt.subplot(1, 2, 1)
+        plt.plot(steps_record, cumulative_rewards, label="Cumulative Reward", color='blue')
+        plt.xlabel("Steps")
+        plt.ylabel("Cumulative Reward")
+        plt.title("Cumulative Reward vs Steps")
         plt.legend()
         plt.grid(True)
 
-        plots_dir = os.path.join(self.config.log_dir, 'plots')
-        os.makedirs(plots_dir, exist_ok=True)
-        plot_path = os.path.join(plots_dir, f'average_reward_episode_{episode}.png')
-        plt.savefig(plot_path)
+        # Subplot 2: Lap Time vs Steps
+        plt.subplot(1, 2, 2)
+        plt.plot(steps_record, lap_times, label="Lap Time", color='orange')
+        plt.xlabel("Steps")
+        plt.ylabel("Lap Time (s)")
+        plt.title("Lap Time vs Steps")
+        plt.legend()
+        plt.grid(True)
+
+        # Save the plots
+        plt.tight_layout()
+        plt.savefig(f"{filename_prefix}_step_{steps}.png")
         plt.close()
-        logger.info(f"Saved reward plot to {plot_path}")
+        logger.info(f"Saved training metrics plot to {filename_prefix}_step_{steps}.png")
 
     def run(self):
         logger.info("Starting PPO training...")
         for episode in range(1, self.config.num_episodes + 1):
             state = self.env.reset()
             episode_reward = 0
+            episode_steps = 0
+            lap_time = 0.0  # Initialize lap_time for the episode
 
             for step in range(self.config.max_steps):
                 action, log_prob = self.agent.select_action(state)
 
                 clamped_action = np.clip(action, -1, 1)
 
-                next_state, reward, terminated, truncated, _ = self.env.step(clamped_action)
+                next_state, reward, terminated, truncated, info = self.env.step(clamped_action)
                 done = terminated or truncated
 
+                # Extract lap_time from info if available
+                if 'lap_time' in info:
+                    lap_time = info['lap_time']
+                else:
+                    # Handle cases where lap_time is not provided
+                    lap_time = 0.0
+
+                # Store transition
                 self.agent.store_transition(state, action, log_prob, reward, done)
                 state = next_state
                 episode_reward += reward
+                episode_steps += 1
+                self.cumulative_steps += 1
 
                 if done:
                     break
 
-            # Update policy
+            # Update policy if enough transitions are collected
             if len(self.agent.memory['states']) >= self.config.memory_size:
                 logger.info(f"Updating policy at episode {episode}")
                 self.agent.update()
@@ -457,16 +485,32 @@ class PPOTrainer:
             self.total_rewards.append(episode_reward)
             avg_reward = np.mean(self.total_rewards[-100:])
 
+            # Append to episode_numbers and avg_rewards
+            self.episode_numbers.append(episode)
+            self.avg_rewards.append(avg_reward)
+
+            # Append new metrics
+            self.lap_times.append(lap_time)
+            self.steps_record.append(self.cumulative_steps)
+
             logger.info(
                 f"Episode {episode}/{self.config.num_episodes} | "
                 f"Reward: {episode_reward:.2f} | "
-                f"Average Reward (last 100): {avg_reward:.2f}"
+                f"Average Reward (last 100): {avg_reward:.2f} | "
+                f"Lap Time: {lap_time:.2f} | Steps: {episode_steps}"
             )
 
             # Plot and save rewards at intervals
             if episode % self.config.log_interval == 0:
-                self.plot_and_save_rewards(episode, avg_reward)
+                self.plot_and_save_graphs(
+                    steps=episode,
+                    cumulative_rewards=self.total_rewards.copy(),
+                    lap_times=self.lap_times.copy(),
+                    steps_record=self.steps_record.copy(),
+                    filename_prefix=os.path.join(self.config.log_dir, 'plots', 'training_metrics')
+                )
 
+                # Save best model if average reward improves
                 if avg_reward > self.best_reward:
                     self.best_reward = avg_reward
                     best_model_path = os.path.join(self.config.model_dir, 'best_model.pth')
@@ -482,10 +526,22 @@ class PPOTrainer:
         # Final plotting if not captured by log_interval
         if self.config.num_episodes % self.config.log_interval != 0:
             last_avg_reward = np.mean(self.total_rewards[-100:])
-            self.plot_and_save_rewards(self.config.num_episodes, last_avg_reward)
+            self.episode_numbers.append(self.config.num_episodes)
+            self.avg_rewards.append(last_avg_reward)
+            self.lap_times.append(lap_time)
+            self.steps_record.append(self.cumulative_steps)
+            self.plot_and_save_graphs(
+                steps=self.config.num_episodes,
+                cumulative_rewards=self.total_rewards.copy(),
+                lap_times=self.lap_times.copy(),
+                steps_record=self.steps_record.copy(),
+                filename_prefix=os.path.join(self.config.log_dir, 'plots', 'training_metrics')
+            )
 
         self.env.close()
         logger.info("PPO training completed.")
+
+
 
 def train_ppo():
     config = PPOConfig()
