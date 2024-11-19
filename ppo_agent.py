@@ -28,6 +28,9 @@ logger = logging.getLogger("PPO_AGENT")
 
 @dataclass
 class PPOConfig:
+    """
+    Configuration parameters for the PPO agent.
+    """
     DEVICE: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     OBSERVATION_SPACE: int = 83
     ACTION_SPACE: int = 3
@@ -50,6 +53,9 @@ class PPOConfig:
 
 
 class Actor(nn.Module):
+    """
+    Actor network for the PPO agent. Outputs the mean and standard deviation for action distribution.
+    """
     def __init__(self, obs_dim, act_dim, hidden_dim=256):
         super(Actor, self).__init__()
         lidar_dim = 72
@@ -69,6 +75,7 @@ class Actor(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
+        # Combined network after concatenating lidar and other features
         self.combined_net = nn.Sequential(
             nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
             nn.LeakyReLU(negative_slope=0.01),
@@ -76,11 +83,16 @@ class Actor(nn.Module):
             nn.LeakyReLU(negative_slope=0.01)
         )
 
+        # Output layers for mean and log standard deviation of actions
         self.mean = nn.Linear(hidden_dim, act_dim)
         self.log_std = nn.Linear(hidden_dim, act_dim)
         self._initialize_weights()
 
     def _initialize_weights(self):
+        """
+       Initializes the weights of the neural network layers using Xavier uniform initialization.
+       Biases are initialized to zero.
+       """
         for layer in self.lidar_net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
@@ -99,6 +111,11 @@ class Actor(nn.Module):
         nn.init.zeros_(self.log_std.bias)
 
     def forward(self, state):
+        """
+        Forward pass through the critic network.
+        :param state: Input state tensor
+        :return: Value estimate tensor
+        """
         lidar_dim = 72
         lidar = state[:, :lidar_dim]
         other = state[:, lidar_dim:]
@@ -522,6 +539,8 @@ class PPOTrainer:
             lap_time = 0
 
             for step in range(self.config.MAX_STEPS):
+                episode_start_time = time.time()
+
                 action, log_prob = self.agent.select_action(state)
 
                 clamped_action = np.clip(action, -1, 1)
@@ -529,18 +548,18 @@ class PPOTrainer:
                 next_state, reward, terminated, truncated, info = self.env.step(clamped_action)
                 done = terminated or truncated
 
-                if 'lap_time' in info:
-                    lap_time = info['lap_time']
-                else:
-                    lap_time = 0.0
-
                 self.agent.store_transition(state, action, log_prob, reward, done)
                 state = next_state
                 episode_reward += reward
                 episode_steps += 1
                 self.cumulative_steps += 1
 
+
                 if done:
+                    episode_time = time.time() - episode_start_time
+
+                    if float(reward) > 25:
+                        lap_time = episode_time
                     break
 
             if len(self.agent.memory['states']) >= self.config.MEMORY_SIZE:
@@ -583,6 +602,7 @@ class PPOTrainer:
 
 
 def train_ppo():
+    """Starts PPO training."""
     config = PPOConfig()
     trainer = PPOTrainer(config)
     trainer.run()
