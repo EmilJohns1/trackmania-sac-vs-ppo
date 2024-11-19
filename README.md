@@ -1,7 +1,7 @@
 # Setup Guide
 
 Here are the steps to setup a virtual environment with the necessary dependencies for running the project.
-This guide assumes you have already followed the installation instructions of [the TMRL repository](https://github.com/trackmania-rl/tmrl)
+This guide assumes you have already followed the installation instructions of the [TMRL repository](https://github.com/trackmania-rl/tmrl/blob/master/readme/Install.md)
 
 ## Prerequisites
 

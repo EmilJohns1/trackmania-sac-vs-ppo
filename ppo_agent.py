@@ -275,7 +275,6 @@ class PPOAgent:
         return returns, advantages
 
     def update(self):
-        """Update policy and value networks."""
         if not self.memory['states']:
             logger.warning("No transitions to update.")
             return
@@ -364,7 +363,6 @@ class PPOAgent:
         }
 
     def save(self, path="agents/ppo/saved_agent.pth"):
-        """Saves the PPO agent (actor, critics, and optimizers)."""
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save({
@@ -378,7 +376,6 @@ class PPOAgent:
             logger.error(f"Failed to save PPO agent to {path}: {e}")
 
     def load(self, path="agents/ppo/saved_agent.pth"):
-        """Loads the PPO agent (actor, critics, and optimizers)."""
         try:
             checkpoint = torch.load(path, map_location=self.device)
             self.actor.load_state_dict(checkpoint['actor_state_dict'])
@@ -473,7 +470,6 @@ class PPOTrainer:
 
     def save_graph_data(self, cumulative_rewards, lap_times, steps_record, last_step,
                         filename="graphs/ppo/graph_data.pkl"):
-        """Saves graph data to a file."""
         try:
             min_length = min(len(cumulative_rewards), len(lap_times), len(steps_record))
             if not (len(cumulative_rewards) == len(lap_times) == len(steps_record)):
@@ -498,7 +494,6 @@ class PPOTrainer:
             logger.error(f"Failed to save graph data: {e}")
 
     def load_graph_data(self, filename="graphs/ppo/graph_data.pkl"):
-        """Loads graph data from a file."""
         try:
             with open(filename, 'rb') as f:
                 data = pickle.load(f)

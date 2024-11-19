@@ -185,12 +185,6 @@ class SACAgent:
         return reward
 
     def compute_fisher_matrix(self, replay_buffer, num_samples=100):
-        """
-        Computes the Fisher Information Matrix (FIM) using the replay buffer.
-        Args:
-            replay_buffer: Replay buffer to sample data from.
-            num_samples: Number of samples to use for computing FIM.
-        """
         self.fisher_matrix = {}
         self.prev_params = {}
 
@@ -219,11 +213,6 @@ class SACAgent:
                 self.prev_params[name] = param.data.clone()
 
     def ewc_loss(self):
-        """
-        Computes the EWC loss to regularize updates.
-        Returns:
-            Regularization loss term for EWC.
-        """
         loss = 0.0
         for name, param in self.actor.named_parameters():
             if name in self.fisher_matrix:
@@ -299,7 +288,6 @@ class SACAgent:
         return torch.tensor(normalized_obs, dtype=torch.float32).to(self.device)
 
     def save(self, path="agents/sac/saved_agent.pth"):
-        """Saves the SAC agent (actor, critics, and optimizers)."""
         torch.save({
             'actor': self.actor.state_dict(),
             'critic1': self.critic1.state_dict(),
@@ -321,7 +309,6 @@ class SACAgent:
         print(f"SAC agent saved to {path}")
 
     def load(self, path="agents/sac/saved_agent.pth"):
-        """Loads the SAC agent (actor, critics, and optimizers)."""
         checkpoint = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic1.load_state_dict(checkpoint['critic1'])
@@ -367,13 +354,11 @@ class ReplayBuffer:
         return len(self.buffer)
 
     def save(self, path="agents/sac/replay_buffer.pkl"):
-        """Saves the replay buffer to a file."""
         with open(path, 'wb') as f:
             pickle.dump(self.buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"Replay buffer saved to {path}")
 
     def load(self, path="agents/sac/replay_buffer.pkl"):
-        """Loads the replay buffer from a file."""
         with open(path, 'rb') as f:
             self.buffer = pickle.load(f)
         print(f"Replay buffer loaded from {path}")
@@ -431,7 +416,6 @@ class SACTrainer:
         print(f"Saved graphs at step {steps}.")
 
     def save_graph_data(self, cumulative_rewards, lap_times, steps_record, last_step, filename="graphs/sac/graph_data.pkl"):
-        """Saves graph data to a file."""
         try:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -447,7 +431,6 @@ class SACTrainer:
             print(f"Failed to save graph data: {e}")
 
     def load_graph_data(self, filename="graphs/sac/graph_data.pkl"):
-        """Loads graph data from a file."""
         try:
             with open(filename, 'rb') as f:
                 data = pickle.load(f)
