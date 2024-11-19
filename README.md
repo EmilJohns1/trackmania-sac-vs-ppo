@@ -1,3 +1,58 @@
+# Setup Guide
+
+Here are the steps to setup a virtual environment with the necessary dependencies for running the project.
+
+## Prerequisites
+
+Make sure you have the following installed on your system:
+- **Python 3.12.3** (other versions might work, but not tested)
+- **pip** (package installer for Python)
+
+## Setup Steps
+
+### 1. Clone the Repository
+Clone the project repository to your local machine:
+```bash
+git clone https://github.com/EmilJohns1/trackmania-sac-vs-ppo.git
+cd trackmania-sac-vs-ppo
+```
+
+### 2. Create a Virtual Environment
+Create a virtual environment in the `.venv` directory:
+```bash
+python -m venv .venv
+```
+
+### 3. Activate the Virtual Environment
+Run the `activate` script of your virtual environment:
+- **Windows**:
+  ```bash
+  .venv\Scripts\activate
+  ```
+- **Linux/macOS**:
+  ```bash
+  source .venv/bin/activate
+  ```
+
+### 4. Install Dependencies
+Install the required Python packages listed in the `requirements.txt` file:
+```bash
+pip install -r requirements.txt
+```
+
+### 5. Run Project
+You should now be able to run the agent of your choice:
+- **PPO Agent**:
+  ```bash
+  python main.py --agent ppo
+  ```
+- **SAC Agent**:
+  ```bash
+  python main.py --agent sac
+  ```
+
+---
+
 # SAC progress
 
 Initially, after creating the SAC (Soft Actor-Critic) agent, we noticed it wasn’t learning effectively. We concluded that our model either wasn’t complex enough or didn’t have the computational power to train on the TM20Full environment, which has a high-dimensional observation space consisting of speed, gear, RPM, and four 64 x 64 images. This led us to switch to the TM20Lidar environment, which instead provides 4 x 19 Lidar beams. With this reduced observation space, we could process the inputs using a Multilayer Perceptron (MLP) for the Actor and Critics.
