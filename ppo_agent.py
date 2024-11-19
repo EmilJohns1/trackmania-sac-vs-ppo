@@ -366,7 +366,7 @@ class PPOAgent:
     def save(self, path="agents/ppo/saved_agent.pth"):
         """Saves the PPO agent (actor, critics, and optimizers)."""
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)  # Ensure the directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save({
                 'actor_state_dict': self.actor.state_dict(),
                 'critic_state_dict': self.critic.state_dict(),
@@ -400,7 +400,6 @@ class PPOTrainer:
         self.env = get_environment()
         self.agent = PPOAgent(config)
 
-        # Initialize lists
         self.total_rewards: List[float] = []
         self.best_reward: float = -float('inf')
 
@@ -412,14 +411,12 @@ class PPOTrainer:
         self.cumulative_steps: int = 0
 
         try:
-            # Assign loaded data to the correct variables
             loaded_rewards, loaded_lap_times, loaded_steps_record, self.last_step = self.load_graph_data()
             self.total_rewards = loaded_rewards
             self.lap_times = loaded_lap_times
             self.steps_record = loaded_steps_record
             self.cumulative_steps = self.last_step
 
-            # Truncate lists to the minimum length to ensure consistency
             min_length = min(len(self.total_rewards), len(self.lap_times), len(self.steps_record))
             if not (len(self.total_rewards) == len(self.lap_times) == len(self.steps_record)):
                 logger.warning(
@@ -440,9 +437,8 @@ class PPOTrainer:
     def plot_and_save_graphs(self, steps, cumulative_rewards, lap_times, steps_record,
                              filename_prefix="graphs/ppo/performance"):
         try:
-            os.makedirs(os.path.dirname(filename_prefix), exist_ok=True)  # Ensure the directory exists
+            os.makedirs(os.path.dirname(filename_prefix), exist_ok=True)
 
-            # Validate that all lists have the same length
             if not (len(steps_record) == len(cumulative_rewards) == len(lap_times)):
                 logger.error(
                     f"Data length mismatch: steps_record({len(steps_record)}), "
@@ -479,7 +475,6 @@ class PPOTrainer:
                         filename="graphs/ppo/graph_data.pkl"):
         """Saves graph data to a file."""
         try:
-            # Ensure all lists have the same length before saving
             min_length = min(len(cumulative_rewards), len(lap_times), len(steps_record))
             if not (len(cumulative_rewards) == len(lap_times) == len(steps_record)):
                 logger.warning(
@@ -489,7 +484,7 @@ class PPOTrainer:
                 lap_times = lap_times[:min_length]
                 steps_record = steps_record[:min_length]
 
-            os.makedirs(os.path.dirname(filename), exist_ok=True)  # Ensure the directory exists
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
 
             with open(filename, 'wb') as f:
                 pickle.dump({
