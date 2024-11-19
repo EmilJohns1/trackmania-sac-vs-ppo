@@ -1,4 +1,4 @@
-# Progress
+# SAC progress
 
 Initially, after creating the SAC (Soft Actor-Critic) agent, we noticed it wasn’t learning effectively. We concluded that our model either wasn’t complex enough or didn’t have the computational power to train on the TM20Full environment, which has a high-dimensional observation space consisting of speed, gear, RPM, and four 64 x 64 images. This led us to switch to the TM20Lidar environment, which instead provides 4 x 19 Lidar beams. With this reduced observation space, we could process the inputs using a Multilayer Perceptron (MLP) for the Actor and Critics.
 
@@ -14,9 +14,21 @@ Additionally, we revised our reward system. We introduced harsher penalties for 
 
 However, over time, the agent’s performance began to degrade. We hypothesized that this was due to the excessive penalty for colliding with walls combined with an insufficient constant time penalty. This caused the agent to drive very slowly to avoid wall collisions, which is illustrated in the video and graph below:
 
-![Performance Graph](readme/graphs/policy_drift.png)
+![Policy drift](readme/graphs/policy_drift.png)
 [![Watch the video](https://img.youtube.com/vi/WVIzBIZRctk/0.jpg)](https://www.youtube.com/watch?v=WVIzBIZRctk)
 
 To address this, we adjusted the reward system again. We increased the constant time penalty from 0.1 to 0.2 and decreased the collision penalty from -10 to -8. We also increased the penalty for excessive steering from -0.5 to -1.0 to prevent the agent from steering erratically, as observed in earlier runs.
 
 These adjustments aim to balance speed and safety, enabling the agent to drive more effectively within the constraints of the environment.
+
+We then realized that these custom rewards were only hindering the agent's learning as it worked best with the default reward system.
+
+After this, we experimented with different hyperparameters, and found that the ones provided in the tmrl config worked best, the graph with these parameters can be seen below.
+
+![Performance graph](readme/graphs/performance.png)
+
+We can see that the agent reaches a plateau after around 75 000 steps, where it reaches an 'optimal' driving style and doesnt improve much after this.
+
+A video of a complete lap done by the trained SAC agent can be seen below:
+
+[![Watch the video](https://img.youtube.com/vi/D21icJWTuX8/0.jpg)](https://www.youtube.com/watch?v=D21icJWTuX8)
