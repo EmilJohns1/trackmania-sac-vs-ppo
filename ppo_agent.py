@@ -517,6 +517,8 @@ class PPOTrainer:
             lap_time = 0
 
             for step in range(self.config.MAX_STEPS):
+                episode_start_time = time.time()
+
                 action, log_prob = self.agent.select_action(state)
 
                 clamped_action = np.clip(action, -1, 1)
@@ -524,18 +526,18 @@ class PPOTrainer:
                 next_state, reward, terminated, truncated, info = self.env.step(clamped_action)
                 done = terminated or truncated
 
-                if 'lap_time' in info:
-                    lap_time = info['lap_time']
-                else:
-                    lap_time = 0.0
-
                 self.agent.store_transition(state, action, log_prob, reward, done)
                 state = next_state
                 episode_reward += reward
                 episode_steps += 1
                 self.cumulative_steps += 1
 
+
                 if done:
+                    episode_time = time.time() - episode_start_time
+
+                    if float(reward) > 25:
+                        lap_time = episode_time
                     break
 
             if len(self.agent.memory['states']) >= self.config.MEMORY_SIZE:
