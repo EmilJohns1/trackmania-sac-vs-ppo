@@ -370,6 +370,7 @@ class SACTrainer:
         self.max_steps = config.MAX_STEPS
         self.batch_size = config.BATCH_SIZE
         self.save_interval = config.SAVE_INTERVAL
+        self.last_step = 0
 
         self.env = get_environment()
         self.agent = SACAgent(config)
